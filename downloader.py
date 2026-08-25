@@ -62,17 +62,18 @@ def _tmp_path(prefix: str) -> str:
 
 # ─── Определение платформы ────────────────────────────────────────────────────
 
-_TIKTOK_RE  = re.compile(r"tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com", re.IGNORECASE)
-_LIKEE_RE   = re.compile(r"https?://(?:l\.)?likee\.video/", re.IGNORECASE)
-_VK_RE      = re.compile(r"https?://(?:(?:www|m)\.)?vk\.(?:com|ru)/(?:video|clips?)", re.IGNORECASE)
-_YOUTUBE_RE = re.compile(
+_TIKTOK_RE    = re.compile(r"tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com", re.IGNORECASE)
+_LIKEE_RE     = re.compile(r"https?://(?:l\.)?likee\.video/", re.IGNORECASE)
+_VK_RE        = re.compile(r"https?://(?:(?:www|m)\.)?vk\.(?:com|ru)/(?:video|clips?)", re.IGNORECASE)
+_YOUTUBE_RE   = re.compile(
     r"https?://(?:(?:www|m)\.)?(?:youtube\.com/(?:shorts/|watch\?|embed/|v/|live/)|youtu\.be/)",
     re.IGNORECASE,
 )
+_INSTAGRAM_RE = re.compile(r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/", re.IGNORECASE)
 
 
 def detect_platform(url: str) -> str | None:
-    """Возвращает 'tiktok', 'likee', 'youtube', 'vk' или None."""
+    """Возвращает 'tiktok', 'likee', 'youtube', 'vk', 'instagram' или None."""
     if _TIKTOK_RE.search(url):
         return "tiktok"
     if _LIKEE_RE.match(url):
@@ -81,6 +82,8 @@ def detect_platform(url: str) -> str | None:
         return "youtube"
     if _VK_RE.match(url):
         return "vk"
+    if _INSTAGRAM_RE.match(url):
+        return "instagram"
     return None
 
 
@@ -149,6 +152,14 @@ async def download_youtube(url: str, save_path: str | None = None) -> tuple[str,
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, _download_ytdlp_sync, url, save_path, "youtube", "YouTube Video"
+    )
+
+
+async def download_instagram(url: str, save_path: str | None = None) -> tuple[str, str]:
+    """Скачивает Instagram Reels через yt-dlp. Возвращает (путь к файлу, название)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _download_ytdlp_sync, url, save_path, "instagram", "Instagram Reel"
     )
 
 

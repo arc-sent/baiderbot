@@ -18,7 +18,7 @@ from telegram.ext import (
 from dotenv import load_dotenv
 
 import db
-from downloader import detect_platform, download_tiktok, download_likee, download_youtube, download_vk
+from downloader import detect_platform, download_tiktok, download_likee, download_youtube, download_vk, download_instagram
 
 load_dotenv()
 
@@ -43,6 +43,7 @@ PLATFORM_LABELS = {
     "likee": "Likee",
     "youtube": "YouTube Shorts",
     "vk": "VK",
+    "instagram": "Instagram Reels",
 }
 
 logging.basicConfig(
@@ -100,6 +101,8 @@ async def _download_video(platform: str, url: str, vk_token: str | None = None) 
             coro = download_youtube(url, None)
         elif platform == "vk":
             coro = download_vk(url, vk_token)
+        elif platform == "instagram":
+            coro = download_instagram(url, None)
         else:
             raise ValueError(f"Неизвестная платформа: {platform}")
 
@@ -862,12 +865,12 @@ async def _schedule_post(
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.ensure_user(update.effective_user.id)
     await update.message.reply_text(
-        "Привет! Я скачиваю видео из TikTok, Likee, YouTube Shorts и VK и публикую в твою группу VK.\n\n"
+        "Привет! Я скачиваю видео из TikTok, Instagram Reels, Likee, YouTube Shorts и VK и публикую в твою группу VK.\n\n"
         "Кнопки внизу:\n"
         f"{BTN_TOKEN} — посмотреть / изменить / удалить VK токен\n"
         f"{BTN_GROUPS} — управление группами VK\n"
         f"{BTN_TEMPLATES} — заготовки описаний\n\n"
-        "Чтобы опубликовать видео — просто пришли ссылку на TikTok, Likee, YouTube Shorts или VK.",
+        "Чтобы опубликовать видео — просто пришли ссылку на TikTok, Instagram Reels, Likee, YouTube Shorts или VK.",
         reply_markup=main_keyboard(),
     )
 
@@ -881,6 +884,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text(
             "Не распознал ссылку. Поддерживаются:\n"
             "• TikTok (tiktok.com)\n"
+            "• Instagram Reels (instagram.com/reel/…)\n"
             "• Likee (likee.video)\n"
             "• YouTube Shorts (youtube.com/shorts…, youtu.be)\n"
             "• VK видео и клипы (vk.com/video…, vk.com/clip…)"
