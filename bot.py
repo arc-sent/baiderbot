@@ -67,6 +67,7 @@ TIME_SLOTS = [7, 9, 11, 13, 15, 17, 19, 21, 23]
 TIME_SLOTS_ROW_SIZE = 3  # кнопок в строке клавиатуры времени
 
 MAX_GROUPS_PER_USER = 50  # максимум групп VK на одного пользователя
+KEYBOARD_PAGE_SIZE = 15  # максимум элементов на одной странице инлайн-клавиатуры
 
 # ─── Контроль нагрузки на VK (настраивается через .env) ───────────────────────
 # Сколько публикаций ОДНОГО пользователя может уходить в VK одновременно.
@@ -631,32 +632,65 @@ def build_time_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_groups_select_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+def build_groups_select_keyboard(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    all_groups = db.get_groups(telegram_id)
+    total = len(all_groups)
+    start = page * KEYBOARD_PAGE_SIZE
+    page_groups = all_groups[start:start + KEYBOARD_PAGE_SIZE]
     rows = [
         [InlineKeyboardButton(g["name"], callback_data=f"upgroup_{g['id']}")]
-        for g in db.get_groups(telegram_id)
+        for g in page_groups
     ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"upgroup_pg_{page - 1}"))
+    if start + KEYBOARD_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"upgroup_pg_{page + 1}"))
+    if nav:
+        rows.append(nav)
     return InlineKeyboardMarkup(rows)
 
 
-def build_desc_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+def build_desc_keyboard(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    all_templates = db.get_templates(telegram_id)
+    total = len(all_templates)
+    start = page * KEYBOARD_PAGE_SIZE
+    page_templates = all_templates[start:start + KEYBOARD_PAGE_SIZE]
     rows = [
         [InlineKeyboardButton(f"📝 {t['title']}", callback_data=f"updesc_tpl_{t['id']}")]
-        for t in db.get_templates(telegram_id)
+        for t in page_templates
     ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"updesc_pg_{page - 1}"))
+    if start + KEYBOARD_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"updesc_pg_{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("✏️ Написать своё", callback_data="updesc_custom")])
     rows.append([InlineKeyboardButton("➖ Без описания", callback_data="updesc_none")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_groups_manage_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+def build_groups_manage_keyboard(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    all_groups = db.get_groups(telegram_id)
+    total = len(all_groups)
+    start = page * KEYBOARD_PAGE_SIZE
+    page_groups = all_groups[start:start + KEYBOARD_PAGE_SIZE]
     rows = []
-    for g in db.get_groups(telegram_id):
+    for g in page_groups:
         rows.append([InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})", callback_data="noop")])
         rows.append([
             InlineKeyboardButton("✏️ Переименовать", callback_data=f"g_rename_{g['id']}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"g_del_{g['id']}"),
         ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"g_pg_{page - 1}"))
+    if start + KEYBOARD_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"g_pg_{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Добавить группу", callback_data="g_add")])
     return InlineKeyboardMarkup(rows)
 
@@ -679,14 +713,25 @@ def _mask_token(token: str) -> str:
     return f"{token[:6]}…{token[-4:]}"
 
 
-def build_templates_manage_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+def build_templates_manage_keyboard(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    all_templates = db.get_templates(telegram_id)
+    total = len(all_templates)
+    start = page * KEYBOARD_PAGE_SIZE
+    page_templates = all_templates[start:start + KEYBOARD_PAGE_SIZE]
     rows = []
-    for t in db.get_templates(telegram_id):
+    for t in page_templates:
         rows.append([InlineKeyboardButton(f"📝 {t['title']}", callback_data="noop")])
         rows.append([
             InlineKeyboardButton("✏️ Изменить", callback_data=f"t_edit_{t['id']}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"t_del_{t['id']}"),
         ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"t_pg_{page - 1}"))
+    if start + KEYBOARD_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"t_pg_{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Добавить заготовку", callback_data="t_add")])
     return InlineKeyboardMarkup(rows)
 
@@ -918,6 +963,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def handle_group_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+
+    if query.data.startswith("upgroup_pg_"):
+        page = int(query.data[len("upgroup_pg_"):])
+        telegram_id = update.effective_user.id
+        platform = context.user_data.get("platform", "")
+        await query.edit_message_text(
+            f"Ссылка {PLATFORM_LABELS.get(platform, platform)} принята.\nВ какую группу опубликовать?",
+            reply_markup=build_groups_select_keyboard(telegram_id, page),
+        )
+        return UP_GROUP
+
     group_row_id = int(query.data.split("_")[1])
     group = db.get_group(group_row_id)
     if not group:
@@ -938,6 +994,16 @@ async def handle_desc_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data.startswith("updesc_pg_"):
+        page = int(data[len("updesc_pg_"):])
+        telegram_id = update.effective_user.id
+        group_name = context.user_data.get("vk_group_name", "")
+        await query.edit_message_text(
+            f"Группа: {group_name}\n\nВыбери описание:",
+            reply_markup=build_desc_keyboard(telegram_id, page),
+        )
+        return UP_DESC
 
     if data == "updesc_custom":
         await query.edit_message_text("Введи текст описания для публикации:")
@@ -1135,6 +1201,15 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.answer()
         return ConversationHandler.END
 
+    if data.startswith("g_pg_"):
+        await query.answer()
+        page = int(data[len("g_pg_"):])
+        await query.edit_message_text(
+            "Твои группы VK:",
+            reply_markup=build_groups_manage_keyboard(update.effective_user.id, page),
+        )
+        return ConversationHandler.END
+
     if data == "g_add":
         await query.answer()
         if db.count_groups(update.effective_user.id) >= MAX_GROUPS_PER_USER:
@@ -1266,6 +1341,15 @@ async def templates_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data == "noop":
         await query.answer()
+        return ConversationHandler.END
+
+    if data.startswith("t_pg_"):
+        await query.answer()
+        page = int(data[len("t_pg_"):])
+        await query.edit_message_text(
+            "Твои заготовки описаний:",
+            reply_markup=build_templates_manage_keyboard(update.effective_user.id, page),
+        )
         return ConversationHandler.END
 
     if data == "t_add":
@@ -1591,7 +1675,7 @@ def main() -> None:
     groups_conv = ConversationHandler(
         entry_points=[
             CommandHandler("groups", cmd_groups),
-            CallbackQueryHandler(groups_button, pattern=r"^(g_add|g_del_|g_rename_|noop$)"),
+            CallbackQueryHandler(groups_button, pattern=r"^(g_add|g_del_|g_rename_|g_pg_|noop$)"),
         ],
         states={
             G_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_id)],
@@ -1610,7 +1694,7 @@ def main() -> None:
     templates_conv = ConversationHandler(
         entry_points=[
             CommandHandler("templates", cmd_templates),
-            CallbackQueryHandler(templates_button, pattern=r"^(t_add|t_del_|t_edit_|noop$)"),
+            CallbackQueryHandler(templates_button, pattern=r"^(t_add|t_del_|t_edit_|t_pg_|noop$)"),
         ],
         states={
             T_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, templates_title)],
