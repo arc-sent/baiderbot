@@ -64,7 +64,13 @@ def _tmp_path(prefix: str) -> str:
 
 _TIKTOK_RE    = re.compile(r"tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com", re.IGNORECASE)
 _LIKEE_RE     = re.compile(r"https?://(?:l\.)?likee\.video/", re.IGNORECASE)
-_VK_RE        = re.compile(r"https?://(?:(?:www|m)\.)?vk\.(?:com|ru)/(?:video|clips?)", re.IGNORECASE)
+# vk.com / vk.ru / vkvideo.ru: прямые ссылки (video-1_2, clip-1_2) и «оверлеи»
+# вида vk.com/clips/имя?z=clip-1_2, vk.com/feed?z=video-1_2 — ролик в параметре.
+_VK_RE        = re.compile(
+    r"https?://(?:(?:www|m)\.)?(?:vk\.(?:com|ru)|vkvideo\.ru)/"
+    r"(?:video|clips?|\S*[?&]z=(?:video|clip)-?\d+_\d+)",
+    re.IGNORECASE,
+)
 _YOUTUBE_RE   = re.compile(
     r"https?://(?:(?:www|m)\.)?(?:youtube\.com/(?:shorts/|watch\?|embed/|v/|live/)|youtu\.be/)",
     re.IGNORECASE,
@@ -319,9 +325,10 @@ def _extract_vk_ids(url: str) -> tuple[str, str] | None:
 
 
 def _to_vkcom(url: str) -> str:
-    url = re.sub(r'https?://(?:www\.)?vk\.ru/', 'https://vk.com/', url, flags=re.IGNORECASE)
-    url = re.sub(r'https?://m\.vk\.com/', 'https://vk.com/', url, flags=re.IGNORECASE)
-    return url
+    return re.sub(
+        r'https?://(?:(?:(?:www|m)\.)?(?:vk\.ru|vkvideo\.ru)|m\.vk\.com)/',
+        'https://vk.com/', url, flags=re.IGNORECASE,
+    )
 
 
 def _og_title(html: str) -> str:
@@ -507,6 +514,12 @@ def _download_vk_ytdlp_sync(url: str) -> tuple[str, str]:
 
 
 def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
+    # Ссылки-«оверлеи» (vk.com/clips/имя?z=clip-1_2) и vkvideo.ru приводим к
+    # каноничному vk.com/video-1_2 — его понимают и мобильная версия, и yt-dlp.
+    ids = _extract_vk_ids(url)
+    if ids:
+        url = f"https://vk.com/video{ids[0]}_{ids[1]}"
+
     # Пробуем быстрый путь: embed / ajax / VK API / mobile.
     # Для клипов и HLS-видео он почти всегда заканчивается ValueError —
     # тогда падаем на yt-dlp, который умеет и клипы, и HLS.

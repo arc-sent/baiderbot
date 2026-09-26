@@ -39,9 +39,18 @@ from downloader import (
     ("https://www.vk.com/video123_456", "vk"),
     ("https://m.vk.com/video-123_456", "vk"),
     ("https://vk.ru/video-123_456", "vk"),
+    ("https://vkvideo.ru/video-123_456", "vk"),
+    ("https://vkvideo.ru/clip-123_456", "vk"),
+    ("https://vk.com/clips/mygroup?z=clip-123_456", "vk"),
+    ("https://vk.com/feed?z=video-123_456%2Fabc", "vk"),
+    # Instagram
+    ("https://instagram.com/reel/abc", "instagram"),
+    ("https://www.instagram.com/reels/abc/", "instagram"),
     # Нераспознанные
     ("https://google.com", None),
-    ("https://instagram.com/reel/abc", None),
+    ("https://instagram.com/someuser", None),
+    ("https://vk.com/mygroup", None),
+    ("https://vk.com/clubsomething", None),
     ("123123123", None),
     ("просто текст", None),
     ("", None),
@@ -153,6 +162,14 @@ def test_to_vkcom_vkru():
 
 def test_to_vkcom_mobile():
     assert _to_vkcom("https://m.vk.com/video123") == "https://vk.com/video123"
+
+
+def test_to_vkcom_vkvideo():
+    assert _to_vkcom("https://vkvideo.ru/video-1_2") == "https://vk.com/video-1_2"
+
+
+def test_to_vkcom_mobile_vkru():
+    assert _to_vkcom("https://m.vk.ru/video-1_2") == "https://vk.com/video-1_2"
 
 
 def test_to_vkcom_desktop_unchanged():

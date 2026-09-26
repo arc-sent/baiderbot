@@ -1,10 +1,14 @@
 """Тесты чистых функций из bot.py — без реального Telegram-соединения."""
 
 import asyncio
+import os
+from contextlib import contextmanager
 from datetime import date, timedelta
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch, AsyncMock, call
 
 import pytest
+import requests as _requests
+from vk_api.exceptions import ApiError
 
 import bot
 
@@ -567,3 +571,530 @@ class TestTemplatesManagePagination:
 
 def test_keyboard_page_size_is_15():
     assert bot.KEYBOARD_PAGE_SIZE == 15
+
+
+# ─── Helpers: upload tests ────────────────────────────────────────────────────
+
+def _mock_resp(data, *, text=None, raise_for_status=None):
+    """Мок объекта requests.Response."""
+    m = MagicMock()
+    m.json.return_value = data
+    m.text = text or str(data)[:500]
+    if raise_for_status:
+        m.raise_for_status.side_effect = raise_for_status
+    else:
+        m.raise_for_status.return_value = None
+    return m
+
+
+# Типовые ответы VK API
+_CREATE_OK  = {"response": {"upload_url": "https://upload.vk.com/x", "video_id": 42, "owner_id": -100}}
+_UPLOAD_OK  = {"video_id": 42, "owner_id": -100}
+_EDIT_OK    = {"response": 1}
+_PUBLISH_OK = {"response": {"video": {"wall_post_id": 999}}}
+_SAVE_OK    = {"response": {"video_id": 55, "owner_id": -100, "upload_url": "https://upload.vk.com/y"}}
+_WALL_OK    = {"response": {"post_id": 77}}
+_ERR_5      = {"error": {"error_code": 5,  "error_msg": "User authorization failed"}}
+_ERR_15     = {"error": {"error_code": 15, "error_msg": "Access denied"}}
+_ERR_3001   = {"error": {"error_code": 3001, "error_msg": "Video not ready"}}
+
+
+@pytest.fixture
+def tmp_video(tmp_path):
+    """Временный файл-заглушка видео."""
+    f = tmp_path / "video.mp4"
+    f.write_bytes(b"fake_video_data" * 100)
+    return str(f)
+
+
+def _called_urls(mock_post):
+    return [c.args[0] for c in mock_post.call_args_list]
+
+
+# ─── _upload_short_video ──────────────────────────────────────────────────────
+
+# Ответы vk_api уже без обёртки {"response": ...} — библиотека разворачивает сама.
+_CREATE_RESP  = {"upload_url": "https://upload.vk.com/x", "video_id": 42, "owner_id": -100}
+_PUBLISH_RESP = {"video": {"wall_post_id": 999}}
+
+
+def _api_err(code: int, msg: str = "Error") -> ApiError:
+    """Создаёт ApiError с нужным кодом, минуя сложный конструктор vk_api."""
+    err = ApiError.__new__(ApiError)
+    err.code = code
+    err.error = {"error_code": code, "error_msg": msg}
+    err.args = (f"[{code}] {msg}",)
+    return err
+
+
+@contextmanager
+def _vk_mock(create_rv=None, create_se=None,
+             edit_rv=1,    edit_se=None,
+             publish_rv=None, publish_se=None):
+    """Мокирует vk_api.VkApi и возвращает mock-объект vk API."""
+    mock_vk = MagicMock()
+
+    if create_se is not None:
+        mock_vk.shortVideo.create.side_effect = create_se
+    else:
+        mock_vk.shortVideo.create.return_value = create_rv
+
+    if edit_se is not None:
+        mock_vk.shortVideo.edit.side_effect = edit_se
+    else:
+        mock_vk.shortVideo.edit.return_value = edit_rv
+
+    if publish_se is not None:
+        mock_vk.shortVideo.publish.side_effect = publish_se
+    else:
+        mock_vk.shortVideo.publish.return_value = publish_rv
+
+    with patch("vk_api.VkApi") as mock_cls:
+        mock_cls.return_value.get_api.return_value = mock_vk
+        yield mock_vk
+
+
+class TestUploadShortVideo:
+
+    def test_happy_path_no_description(self, tmp_video):
+        """Все этапы успешны, описание пустое — shortVideo.edit не вызывается."""
+        with _vk_mock(create_rv=_CREATE_RESP, publish_rv=_PUBLISH_RESP) as mock_vk, \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            bot._upload_short_video("token", 100, tmp_video, "")
+
+        mock_vk.shortVideo.create.assert_called_once()
+        mock_vk.shortVideo.edit.assert_not_called()
+        mock_vk.shortVideo.publish.assert_called_once()
+
+    def test_happy_path_with_description_calls_edit(self, tmp_video):
+        """С непустым описанием shortVideo.edit вызывается между upload и publish."""
+        with _vk_mock(create_rv=_CREATE_RESP, publish_rv=_PUBLISH_RESP) as mock_vk, \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            bot._upload_short_video("token", 100, tmp_video, "Описание #тег")
+
+        mock_vk.shortVideo.edit.assert_called_once()
+        mock_vk.shortVideo.publish.assert_called_once()
+
+    def test_create_api_error_raises_vkerror(self, tmp_video):
+        with _vk_mock(create_se=_api_err(5, "Auth failed")):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_short_video("token", 100, tmp_video, "")
+        assert exc_info.value.code == 5
+        assert exc_info.value.stage == "VK shortVideo.create"
+
+    def test_create_network_error_raises_vkerror(self, tmp_video):
+        with _vk_mock(create_se=Exception("connection timeout")):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_short_video("token", 100, tmp_video, "")
+        assert exc_info.value.network is True
+        assert exc_info.value.stage == "VK shortVideo.create"
+
+    def test_upload_network_error_raises_vkerror(self, tmp_video):
+        with _vk_mock(create_rv=_CREATE_RESP), \
+             patch("requests.post", side_effect=_requests.exceptions.ConnectionError("upload failed")):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_short_video("token", 100, tmp_video, "")
+        assert exc_info.value.network is True
+        assert exc_info.value.stage == "загрузка файла shortVideo"
+
+    def test_edit_api_error_raises_vkerror(self, tmp_video):
+        with _vk_mock(create_rv=_CREATE_RESP, edit_se=_api_err(15, "Access denied")), \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_short_video("token", 100, tmp_video, "Описание")
+        assert exc_info.value.code == 15
+        assert exc_info.value.stage == "VK shortVideo.edit"
+
+    def test_publish_retries_on_3001_then_succeeds(self, tmp_video, monkeypatch):
+        """Первые две попытки publish возвращают 3001, третья — успех."""
+        monkeypatch.setattr(bot, "VK_SHORT_VIDEO_POLL_INTERVAL", 0)
+        publish_effects = [
+            _api_err(3001, "Video not ready"),
+            _api_err(3001, "Video not ready"),
+            _PUBLISH_RESP,  # третья попытка — успех (return_value через side_effect)
+        ]
+        # side_effect: исключение бросается, словарь — возвращается
+        with _vk_mock(create_rv=_CREATE_RESP, publish_se=publish_effects) as mock_vk, \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            bot._upload_short_video("token", 100, tmp_video, "")
+
+        assert mock_vk.shortVideo.publish.call_count == 3
+
+    def test_publish_3001_exhausted_raises_vkerror(self, tmp_video, monkeypatch):
+        """Все попытки вернули 3001 — VKError(3001) после исчерпания лимита."""
+        monkeypatch.setattr(bot, "VK_SHORT_VIDEO_POLL_ATTEMPTS", 3)
+        monkeypatch.setattr(bot, "VK_SHORT_VIDEO_POLL_INTERVAL", 0)
+        with _vk_mock(create_rv=_CREATE_RESP,
+                      publish_se=[_api_err(3001)] * 3), \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_short_video("token", 100, tmp_video, "")
+        assert exc_info.value.code == 3001
+        assert exc_info.value.stage == "VK shortVideo.publish"
+
+    def test_publish_non_3001_error_raises_immediately(self, tmp_video, monkeypatch):
+        """Ошибка с кодом != 3001 — VKError бросается сразу, polling не продолжается."""
+        monkeypatch.setattr(bot, "VK_SHORT_VIDEO_POLL_INTERVAL", 0)
+        with _vk_mock(create_rv=_CREATE_RESP,
+                      publish_se=_api_err(15, "Access denied")) as mock_vk, \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_short_video("token", 100, tmp_video, "")
+        assert exc_info.value.code == 15
+        assert mock_vk.shortVideo.publish.call_count == 1  # только одна попытка
+
+    def test_file_size_passed_to_create(self, tmp_video):
+        """os.path.getsize(file_path) передаётся как file_size в shortVideo.create."""
+        with _vk_mock(create_rv=_CREATE_RESP, publish_rv=_PUBLISH_RESP) as mock_vk, \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            bot._upload_short_video("token", 100, tmp_video, "")
+
+        _, kwargs = mock_vk.shortVideo.create.call_args
+        assert kwargs["file_size"] == os.path.getsize(tmp_video) // 1024  # в КБ
+
+    def test_upload_uses_file_field_not_video_file(self, tmp_video):
+        """Поле при загрузке называется 'file', а не 'video_file'."""
+        with _vk_mock(create_rv=_CREATE_RESP, publish_rv=_PUBLISH_RESP), \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)) as mock_post:
+            bot._upload_short_video("token", 100, tmp_video, "")
+
+        upload_files = mock_post.call_args.kwargs["files"]
+        assert "file" in upload_files
+        assert "video_file" not in upload_files
+
+    def test_description_passed_to_edit(self, tmp_video):
+        """Текст описания корректно передаётся в shortVideo.edit."""
+        with _vk_mock(create_rv=_CREATE_RESP, publish_rv=_PUBLISH_RESP) as mock_vk, \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            bot._upload_short_video("token", 100, tmp_video, "Мой текст")
+
+        _, kwargs = mock_vk.shortVideo.edit.call_args
+        assert kwargs["description"] == "Мой текст"
+
+    def test_publish_stops_polling_on_success(self, tmp_video, monkeypatch):
+        """После первого успешного publish повторных вызовов нет."""
+        monkeypatch.setattr(bot, "VK_SHORT_VIDEO_POLL_INTERVAL", 0)
+        with _vk_mock(create_rv=_CREATE_RESP, publish_rv=_PUBLISH_RESP) as mock_vk, \
+             patch("requests.post", return_value=_mock_resp(_UPLOAD_OK)):
+            bot._upload_short_video("token", 100, tmp_video, "")
+
+        assert mock_vk.shortVideo.publish.call_count == 1
+
+
+# ─── _upload_video_legacy ─────────────────────────────────────────────────────
+
+class TestUploadVideoLegacy:
+
+    def test_happy_path(self, tmp_video):
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),
+            _mock_resp({}),
+            _mock_resp(_WALL_OK),
+        ]):
+            bot._upload_video_legacy("token", 100, tmp_video, "Title", "Desc")
+
+    def test_save_api_error_raises_vkerror(self, tmp_video):
+        with patch("requests.post", return_value=_mock_resp(_ERR_5)):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_video_legacy("token", 100, tmp_video, "T", "D")
+        assert exc_info.value.code == 5
+        assert exc_info.value.stage == "VK video.save"
+
+    def test_save_network_error_raises_vkerror(self, tmp_video):
+        with patch("requests.post", side_effect=_requests.exceptions.ConnectionError("net")):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_video_legacy("token", 100, tmp_video, "T", "")
+        assert exc_info.value.network is True
+        assert exc_info.value.stage == "VK video.save"
+
+    def test_upload_network_error_raises_vkerror(self, tmp_video):
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),
+            _requests.exceptions.ConnectionError("upload failed"),
+        ]):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_video_legacy("token", 100, tmp_video, "T", "")
+        assert exc_info.value.network is True
+        assert exc_info.value.stage == "загрузка файла в VK"
+
+    def test_wall_post_error_attempts_video_delete(self, tmp_video):
+        """При ошибке wall.post бот пробует откатить видео через video.delete."""
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),
+            _mock_resp({}),
+            _mock_resp(_ERR_15),
+            _mock_resp({"response": 1}),  # video.delete
+        ]) as mock_post:
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_video_legacy("token", 100, tmp_video, "T", "D")
+        assert exc_info.value.code == 15
+        assert exc_info.value.stage == "VK wall.post"
+        assert any("video.delete" in u for u in _called_urls(mock_post))
+
+    def test_wall_post_network_error_raises_vkerror(self, tmp_video):
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),
+            _mock_resp({}),
+            _requests.exceptions.ConnectionError("wall.post failed"),
+        ]):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot._upload_video_legacy("token", 100, tmp_video, "T", "D")
+        assert exc_info.value.network is True
+        assert exc_info.value.stage == "VK wall.post"
+
+    def test_upload_uses_video_file_field(self, tmp_video):
+        """Поле при загрузке называется 'video_file' (legacy-формат)."""
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),
+            _mock_resp({}),
+            _mock_resp(_WALL_OK),
+        ]) as mock_post:
+            bot._upload_video_legacy("token", 100, tmp_video, "T", "")
+
+        upload_files = mock_post.call_args_list[1].kwargs["files"]
+        assert "video_file" in upload_files
+        assert "file" not in upload_files
+
+    def test_description_passed_to_save(self, tmp_video):
+        """Описание передаётся в video.save как параметр description."""
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),
+            _mock_resp({}),
+            _mock_resp(_WALL_OK),
+        ]) as mock_post:
+            bot._upload_video_legacy("token", 100, tmp_video, "Title", "Текст описания")
+
+        save_data = mock_post.call_args_list[0].kwargs["data"]
+        assert save_data["description"] == "Текст описания"
+
+    def test_no_description_key_when_empty(self, tmp_video):
+        """Если описание пустое — ключ description не передаётся в video.save."""
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),
+            _mock_resp({}),
+            _mock_resp(_WALL_OK),
+        ]) as mock_post:
+            bot._upload_video_legacy("token", 100, tmp_video, "Title", "")
+
+        save_data = mock_post.call_args_list[0].kwargs["data"]
+        assert "description" not in save_data
+
+    def test_wall_post_attachment_format(self, tmp_video):
+        """attachments для wall.post формируется как 'video{owner_id}_{video_id}'."""
+        with patch("requests.post", side_effect=[
+            _mock_resp(_SAVE_OK),   # owner_id=-100, video_id=55
+            _mock_resp({}),
+            _mock_resp(_WALL_OK),
+        ]) as mock_post:
+            bot._upload_video_legacy("token", 100, tmp_video, "T", "")
+
+        wall_data = mock_post.call_args_list[2].kwargs["data"]
+        assert wall_data["attachments"] == "video-100_55"
+
+
+# ─── upload_to_vk ─────────────────────────────────────────────────────────────
+
+class TestUploadToVk:
+
+    def test_calls_short_video_first(self, tmp_video):
+        """При успехе shortVideo legacy-метод не вызывается."""
+        with patch("bot._upload_short_video") as mock_short, \
+             patch("bot._upload_video_legacy") as mock_legacy:
+            bot.upload_to_vk("tok", 100, tmp_video, "T", "D")
+        mock_short.assert_called_once()
+        mock_legacy.assert_not_called()
+
+    def test_falls_back_to_legacy_on_vkerror(self, tmp_video):
+        """Если shortVideo бросает VKError — вызывается legacy."""
+        with patch("bot._upload_short_video", side_effect=bot.VKError(15, "err", stage="x")), \
+             patch("bot._upload_video_legacy") as mock_legacy:
+            bot.upload_to_vk("tok", 100, tmp_video, "T", "D")
+        mock_legacy.assert_called_once()
+
+    def test_legacy_receives_correct_args(self, tmp_video):
+        """legacy вызывается с теми же аргументами, что upload_to_vk."""
+        with patch("bot._upload_short_video", side_effect=bot.VKError(1, "err")), \
+             patch("bot._upload_video_legacy") as mock_legacy:
+            bot.upload_to_vk("mytoken", 999, tmp_video, "MyTitle", "MyDesc")
+        mock_legacy.assert_called_once_with("mytoken", 999, tmp_video, "MyTitle", "MyDesc")
+
+    def test_negative_group_id_normalized(self, tmp_video):
+        """Отрицательный vk_group_id нормализуется до abs() перед передачей."""
+        with patch("bot._upload_short_video") as mock_short:
+            bot.upload_to_vk("tok", -100, tmp_video, "T", "D")
+        called_group_id = mock_short.call_args.args[1]
+        assert called_group_id == 100
+
+    def test_legacy_error_propagates(self, tmp_video):
+        """Если оба метода падают — ошибка legacy пробрасывается наружу."""
+        with patch("bot._upload_short_video", side_effect=bot.VKError(1, "short failed")), \
+             patch("bot._upload_video_legacy", side_effect=bot.VKError(5, "legacy failed")):
+            with pytest.raises(bot.VKError) as exc_info:
+                bot.upload_to_vk("tok", 100, tmp_video, "T", "D")
+        assert exc_info.value.code == 5
+
+    def test_short_video_args_match(self, tmp_video):
+        """_upload_short_video вызывается с правильными аргументами."""
+        with patch("bot._upload_short_video") as mock_short:
+            bot.upload_to_vk("mytoken", 42, tmp_video, "Title", "Desc")
+        mock_short.assert_called_once_with("mytoken", 42, tmp_video, "Desc")
+
+
+# ─── Распознавание ссылок на сообщества VK ────────────────────────────────────
+
+@pytest.mark.parametrize("text,expected", [
+    ("https://vk.com/club123456", "club123456"),
+    ("vk.com/public123", "public123"),
+    ("https://vk.ru/club123", "club123"),
+    ("https://m.vk.ru/public55", "public55"),
+    ("https://vk.ru/mygroup", "mygroup"),
+    ("https://m.vk.com/mygroup?from=groups", "mygroup"),
+    ("https://new.vk.com/mygroup", "mygroup"),
+    ("https://vk.com/mygroup/", "mygroup"),
+    ("https://vk.com/mygroup.", "mygroup"),
+    ("https://vk.com/mygroup?w=wall-123_456", "mygroup"),
+    ("Вот группа https://vk.com/mygroup, добавь", "mygroup"),
+    ("https://vk.com/mygroup\nещё текст", "mygroup"),
+    ("https://vk.com/clips/mygroup", "mygroup"),
+    ("https://vkvideo.ru/@mygroup/all", "mygroup"),
+    ("https://vk.me/mygroup", "mygroup"),
+    ("@mygroup", "mygroup"),
+    ("club123", "club123"),
+    ("https://vk.com/wall-123_456", "wall-123_456"),
+])
+def test_extract_screen_name(text, expected):
+    assert bot._extract_screen_name(text) == expected
+
+
+@pytest.mark.parametrize("text,gid", [
+    ("https://vk.com/club123", 123),
+    ("https://vk.ru/public123", 123),
+    ("vk.com/Club123", 123),
+    ("https://vk.com/event77", 77),
+    ("https://vk.com/board55", 55),
+    ("https://vk.com/wall-123_456", 123),
+    ("https://vk.com/video-123_456", 123),
+    ("https://vk.com/videos-123", 123),
+    ("https://vk.com/clips-123", 123),
+    ("https://vk.com/album-123_0", 123),
+    ("https://vk.com/topic-123_1", 123),
+    ("https://vk.com/market-123", 123),
+    ("-123", 123),
+])
+def test_resolve_numeric_links_without_token(text, gid):
+    group_id, name, error = bot.resolve_vk_group(None, text)
+    assert (group_id, name, error) == (gid, None, None)
+
+
+def test_resolve_short_name_without_token_asks_for_token():
+    group_id, _, error = bot.resolve_vk_group(None, "https://vk.com/mygroup")
+    assert group_id is None
+    assert "токен" in error
+
+
+def test_resolve_short_name_via_groups_getbyid():
+    with patch.object(bot, "_vk_call", return_value=({"groups": [{"id": 42, "name": "Моя группа"}]}, None)) as call_:
+        assert bot.resolve_vk_group("tok", "https://vk.ru/mygroup") == (42, "Моя группа", None)
+    call_.assert_called_once_with("groups.getById", "tok", group_id="mygroup")
+
+
+def test_resolve_short_name_falls_back_to_resolve_screen_name():
+    responses = iter([
+        (None, {"error_code": 100, "error_msg": "invalid group_id"}),  # groups.getById
+        ({"type": "event", "object_id": 7}, None),                      # resolveScreenName
+        ({"groups": [{"id": 7, "name": "Встреча"}]}, None),             # имя
+    ])
+    with patch.object(bot, "_vk_call", side_effect=lambda *a, **k: next(responses)):
+        assert bot.resolve_vk_group("tok", "vk.com/myevent") == (7, "Встреча", None)
+
+
+def test_resolve_user_page_rejected():
+    responses = iter([
+        (None, {"error_code": 100, "error_msg": "invalid group_id"}),
+        ({"type": "user", "object_id": 1}, None),
+    ])
+    with patch.object(bot, "_vk_call", side_effect=lambda *a, **k: next(responses)):
+        group_id, _, error = bot.resolve_vk_group("tok", "vk.com/durov")
+    assert group_id is None
+    assert "пользователя" in error
+
+
+def test_resolve_invalid_token_reports_token_problem():
+    with patch.object(bot, "_vk_call", return_value=(None, {"error_code": 5, "error_msg": "auth failed"})):
+        group_id, _, error = bot.resolve_vk_group("tok", "vk.com/mygroup")
+    assert group_id is None
+    assert "токен" in error
+
+
+def test_resolve_rate_limit_not_reported_as_not_found():
+    with patch.object(bot, "_vk_call", return_value=(None, {"error_code": 6, "error_msg": "Too many"})):
+        group_id, _, error = bot.resolve_vk_group("tok", "vk.com/mygroup")
+    assert group_id is None
+    assert "частоту" in error
+
+
+def test_vk_call_retries_on_rate_limit(monkeypatch):
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    with patch.object(bot.requests, "post", side_effect=[
+        _mock_resp({"error": {"error_code": 6, "error_msg": "Too many"}}),
+        _mock_resp({"response": [{"id": 1, "name": "G"}]}),
+    ]) as post:
+        response, err = bot._vk_call("groups.getById", "tok", group_id=1)
+    assert err is None
+    assert response == [{"id": 1, "name": "G"}]
+    assert post.call_count == 2
+
+
+def test_vk_call_does_not_retry_fatal_error(monkeypatch):
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    with patch.object(bot.requests, "post", return_value=_mock_resp(
+        {"error": {"error_code": 5, "error_msg": "auth"}}
+    )) as post:
+        response, err = bot._vk_call("groups.getById", "tok", group_id=1)
+    assert response is None and err["error_code"] == 5
+    assert post.call_count == 1
+
+
+def test_vk_call_network_error(monkeypatch):
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    with patch.object(bot.requests, "post", side_effect=_requests.exceptions.ConnectionError("boom")):
+        response, err = bot._vk_call("groups.getById", "tok", group_id=1)
+    assert response is None and err["error_code"] is None
+
+
+# ─── Фильтры ссылок в сообщениях ──────────────────────────────────────────────
+
+def test_url_filter_finds_link_inside_text():
+    assert bot._URL_FILTER.filter(_msg("Смотри: https://youtu.be/abc !")) is True
+
+
+def test_extract_platform_url_strips_trailing_punct():
+    assert bot.extract_platform_url("вот https://vk.com/clip-1_2.") == ("https://vk.com/clip-1_2", "vk")
+
+
+def test_url_filter_uses_hidden_text_links():
+    m = _msg("видео тут")
+    ent = MagicMock()
+    ent.url = "https://www.tiktok.com/@u/video/1"
+    m.entities = [ent]
+    assert bot._URL_FILTER.filter(m) is True
+
+
+@pytest.mark.parametrize("text", [
+    "https://vk.com/mygroup",
+    "https://vk.ru/club123",
+    "добавь https://m.vk.com/public1",
+])
+def test_community_filter_accepts(text):
+    assert bot._VK_COMMUNITY_FILTER.filter(_msg(text)) is True
+
+
+@pytest.mark.parametrize("text", [
+    "https://vk.com/video-1_2",
+    "https://www.tiktok.com/@u/video/1",
+    "https://notvk.com/mygroup",
+    "https://oauth.vk.com/blank.html#access_token=vk1.a.xxx&expires_in=0",
+    "просто текст",
+])
+def test_community_filter_rejects(text):
+    assert not bot._VK_COMMUNITY_FILTER.filter(_msg(text))

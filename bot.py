@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import random
 import asyncio
 import logging
@@ -9,6 +10,8 @@ from datetime import datetime, timedelta
 
 import pytz
 import requests
+import vk_api
+from vk_api.exceptions import ApiError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -24,6 +27,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 VK_API_VERSION = "5.199"
+VK_SHORT_VIDEO_API_VERSION = "5.126"  # shortVideo методы работают только на этой версии
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
 # Telegram ID администраторов (через запятую в .env) — кто видит ВСЕ ошибки.
@@ -129,6 +133,10 @@ VK_RETRY_BASE_DELAY = float(os.getenv("VK_RETRY_BASE_DELAY", "3"))   # секу�
 # Коды ошибок VK, при которых имеет смысл повторить запрос.
 VK_RETRYABLE_ERROR_CODES = {1, 6, 9, 10}  # неизвестная/too many/flood/internal
 
+# Ожидание обработки клипа на серверах VK (error 3001 = видео ещё не готово).
+VK_SHORT_VIDEO_POLL_ATTEMPTS = int(os.getenv("VK_SHORT_VIDEO_POLL_ATTEMPTS", "12"))
+VK_SHORT_VIDEO_POLL_INTERVAL = float(os.getenv("VK_SHORT_VIDEO_POLL_INTERVAL", "10"))
+
 # Джиттер времени публикации: чтобы ролики не выходили ровно в HH:00:00
 # (для реков — «живее», когда время чуть «плавает»).
 PUBLISH_JITTER_SECONDS = int(os.getenv("PUBLISH_JITTER_SECONDS", "300"))
@@ -181,46 +189,157 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
-_VK_HOST_RE = re.compile(r"(?:https?://)?(?:m\.|www\.)?(?:vk\.com|vkontakte\.ru)/", re.IGNORECASE)
+# Ссылка на VK в любом месте текста. Хосты: vk.com / vk.ru (VK переехал на него,
+# приложение копирует ссылки уже с vk.ru), vkontakte.ru, vk.me, vkvideo.ru,
+# плюс любые поддомены (m., www., new.). Lookbehind не даёт зацепить «notvk.com».
+_VK_LINK_RE = re.compile(
+    r"(?<![\w.-])(?:https?://)?(?:[a-z0-9-]+\.)*"
+    r"(?:vk\.com|vk\.ru|vkontakte\.ru|vk\.me|vkvideo\.ru)/([^\s<>\"'«»]*)",
+    re.IGNORECASE,
+)
+# Сегменты пути, которые обозначают раздел, а не само сообщество:
+# vk.com/clips/mygroup, vkvideo.ru/@mygroup/all и т.п.
+_VK_SECTION_SEGMENTS = {"clips", "video", "videos", "all", "playlists", "shorts"}
+# Разделы, в ссылке на которые после минуса стоит id сообщества:
+# wall-1_2, video-1_2, videos-1, clips-1, album-1_0, topic-1_2, market-1 …
+_VK_OWNER_SECTION_RE = re.compile(
+    r"(?:wall|videos?|clips?|photos?|albums?|topic|market|audios|docs|"
+    r"playlist|podcasts|articles|board)-(\d+)",
+    re.IGNORECASE,
+)
+_TRAILING_PUNCT = ".,;:!?)]}»\"'"
+
+# Типы из utils.resolveScreenName, которые означают сообщество.
+_VK_COMMUNITY_TYPES = {"group", "page", "event", "community"}
+# Ошибки VK, которые не про «такого имени нет», а про токен/лимиты/сеть —
+# их нужно показать пользователю как есть, а не выдавать за «не найдено».
+_VK_FATAL_LOOKUP_CODES = {None, 1, 5, 6, 9, 10, 14, 17, 29}
+
+VK_LOOKUP_RETRIES = int(os.getenv("VK_LOOKUP_RETRIES", "3"))
+VK_LOOKUP_RETRY_DELAY = float(os.getenv("VK_LOOKUP_RETRY_DELAY", "1"))
+
+
+def _message_text(message) -> str:
+    """Текст сообщения + адреса из скрытых ссылок (text_link).
+
+    В пересланных постах ссылка часто «спрятана» под словом — тогда в
+    message.text её нет, она лежит только в entity.url.
+    """
+    text = getattr(message, "text", None) or ""
+    extra = []
+    for ent in getattr(message, "entities", None) or ():
+        url = getattr(ent, "url", None)
+        if isinstance(url, str) and url:
+            extra.append(url)
+    return "\n".join([text, *extra]) if extra else text
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"'«»]+", re.IGNORECASE)
+
+
+def extract_platform_url(text: str | None) -> tuple[str, str] | None:
+    """Находит в тексте первую ссылку на поддерживаемую платформу.
+
+    Возвращает (url, platform) или None. Ссылка может стоять в любом месте
+    сообщения («смотри https://youtu.be/…»), а не только в начале.
+    """
+    if not text:
+        return None
+    for m in _URL_IN_TEXT_RE.finditer(text):
+        url = m.group(0).rstrip(_TRAILING_PUNCT)
+        platform = detect_platform(url)
+        if platform:
+            return url, platform
+    return None
 
 
 def _extract_screen_name(text: str) -> str:
-    """Из ссылки/ввода достаёт «короткое имя» или последний сегмент пути.
+    """Из ссылки/ввода достаёт «короткое имя» сообщества.
 
-    vk.com/club123          -> club123
-    https://vk.com/durov     -> durov
-    vk.com/video-1_2?list=x  -> video-1_2
-    club123                  -> club123
+    vk.com/club123                 -> club123
+    https://vk.ru/durov            -> durov
+    Вот группа https://vk.com/abc  -> abc
+    vk.com/video-1_2?list=x        -> video-1_2
+    vkvideo.ru/@mygroup/all        -> mygroup
+    @mygroup / club123             -> mygroup / club123
     """
     text = text.strip()
-    text = _VK_HOST_RE.sub("", text)            # срезаем хост, если он есть
-    text = text.split("?")[0].split("#")[0]      # убираем query/fragment
-    text = text.strip("/")
-    if "/" in text:                              # на случай vk.com/a/b
-        text = text.rsplit("/", 1)[-1]
-    return text
+    m = _VK_LINK_RE.search(text)
+    if m:
+        path = m.group(1)
+    else:
+        # Ссылки нет — считаем, что прислали само имя / id (одним словом).
+        parts = text.split()
+        path = parts[0] if parts else ""
+    path = path.split("?")[0].split("#")[0]      # убираем query/fragment
+    segments = [s for s in path.split("/") if s]
+    name = next(
+        (s for s in segments if s.lower().lstrip("@") not in _VK_SECTION_SEGMENTS),
+        "",
+    )
+    return name.lstrip("@").rstrip(_TRAILING_PUNCT)
 
 
-def _resolve_screen_name(vk_token: str, screen_name: str) -> dict | None:
-    """VK utils.resolveScreenName: короткое имя -> {type, object_id}. None при сбое."""
+def _vk_call(method: str, vk_token: str, **params) -> tuple[object, dict | None]:
+    """Вызов VK API с ретраями на временные ошибки (лимиты, сеть).
+
+    Возвращает (response, error). error — dict VK {"error_code", "error_msg"};
+    у сетевых сбоев error_code = None. POST, а не GET: иначе access_token попал
+    бы в текст исключения requests (URL с query) и дальше в логи.
+    """
+    err: dict | None = None
+    for attempt in range(max(1, VK_LOOKUP_RETRIES)):
+        try:
+            resp = requests.post(
+                f"https://api.vk.com/method/{method}",
+                data={**params, "access_token": vk_token, "v": VK_API_VERSION},
+                timeout=15,
+            ).json()
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            err = {"error_code": None, "error_msg": f"сетевая ошибка: {exc}"}
+        else:
+            if "error" not in resp:
+                return resp.get("response"), None
+            err = resp["error"]
+            if err.get("error_code") not in VK_RETRYABLE_ERROR_CODES:
+                break
+        logger.info("%s: попытка %s не удалась: %s", method, attempt + 1, err)
+        if attempt + 1 < VK_LOOKUP_RETRIES:
+            time.sleep(VK_LOOKUP_RETRY_DELAY * (2 ** attempt))
+    logger.info("%s error: %s", method, err)
+    return None, err
+
+
+def _vk_error_text(err: dict) -> str:
+    """Понятное пользователю объяснение ошибки VK при поиске сообщества."""
+    code = err.get("error_code")
+    if code is None:
+        return "Не удалось связаться с VK (ошибка сети). Попробуй ещё раз через минуту."
+    if code == 5:
+        return (
+            "VK отклонил твой токен — он недействителен или истёк.\n"
+            f"Обнови его кнопкой «{BTN_TOKEN}» и пришли ссылку ещё раз."
+        )
+    if code in (6, 9, 29):
+        return "VK временно ограничил частоту запросов. Подожди минуту и пришли ссылку ещё раз."
+    if code in (14, 17):
+        return (
+            "VK требует подтверждения (капча / проверка) для этого токена. "
+            f"Зайди в VK с браузера, затем получи новый токен кнопкой «{BTN_TOKEN}»."
+        )
+    return f"VK вернул ошибку {code}: {err.get('error_msg') or 'без описания'}"
+
+
+def _first_group(response) -> dict | None:
+    """Достаёт первую группу из ответа groups.getById (старый и новый формат)."""
     try:
-        resp = requests.get(
-            "https://api.vk.com/method/utils.resolveScreenName",
-            params={
-                "access_token": vk_token,
-                "v": VK_API_VERSION,
-                "screen_name": screen_name,
-            },
-            timeout=15,
-        ).json()
-    except Exception:
-        logger.exception("Ошибка resolveScreenName")
-        return None
-    if "error" in resp:
-        logger.info("resolveScreenName error: %s", resp["error"])
-        return None
-    response = resp.get("response")
-    return response or None  # пустой [] / {} -> имя не найдено
+        if isinstance(response, list):
+            return response[0]
+        if isinstance(response, dict):
+            return response["groups"][0]
+    except (KeyError, IndexError, TypeError):
+        pass
+    return None
 
 
 def resolve_vk_group(vk_token: str | None, text: str) -> tuple[int | None, str | None, str | None]:
@@ -233,95 +352,186 @@ def resolve_vk_group(vk_token: str | None, text: str) -> tuple[int | None, str |
     if not raw:
         return None, None, "Пустая ссылка. Пришли ссылку на сообщество VK."
 
-    # video-1_2 / wall-1 / clip-1_2 / photo-1_2 — id группы это число после минуса
-    m = re.match(r"(?:video|wall|clip|photo)-(\d+)", raw, re.IGNORECASE)
-    if m:
-        gid = int(m.group(1))
+    def by_id(gid: int):
         return gid, fetch_vk_group_name(vk_token, gid) if vk_token else None, None
 
-    # club123 / public123 / event123 — числовой id прямо в имени
-    m = re.match(r"(?:club|public|event)(\d+)$", raw, re.IGNORECASE)
+    # wall-1_2 / video-1_2 / clips-1 / album-1_0 … — id группы это число после минуса
+    m = _VK_OWNER_SECTION_RE.match(raw)
     if m:
-        gid = int(m.group(1))
-        return gid, fetch_vk_group_name(vk_token, gid) if vk_token else None, None
+        return by_id(int(m.group(1)))
+
+    # club123 / public123 / event123 / board123 — числовой id прямо в имени
+    m = re.fullmatch(r"(?:club|public|event|board)(\d+)", raw, re.IGNORECASE)
+    if m:
+        return by_id(int(m.group(1)))
 
     # голый id (вдруг прислали число или -число)
     if re.fullmatch(r"-?\d+", raw):
-        gid = abs(int(raw))
-        return gid, fetch_vk_group_name(vk_token, gid) if vk_token else None, None
+        return by_id(abs(int(raw)))
 
-    # короткое имя сообщества -> resolveScreenName (нужен токен)
+    # короткое имя сообщества — нужен токен
     if not vk_token:
         return None, None, (
             "Чтобы добавить группу по короткой ссылке, сначала задай VK токен "
             f"(кнопка «{BTN_TOKEN}»). Либо пришли ссылку вида vk.com/club123."
         )
-    obj = _resolve_screen_name(vk_token, raw)
+
+    # groups.getById принимает и короткие имена: одним запросом получаем и id,
+    # и название (меньше запросов — меньше шанс словить лимит VK).
+    response, err = _vk_call("groups.getById", vk_token, group_id=raw)
+    group = _first_group(response)
+    if group and group.get("id"):
+        return int(group["id"]), group.get("name"), None
+    if err and err.get("error_code") in _VK_FATAL_LOOKUP_CODES:
+        return None, None, _vk_error_text(err)
+
+    # Не группа (или VK не отдал её) — выясняем, что это за имя.
+    obj, err = _vk_call("utils.resolveScreenName", vk_token, screen_name=raw)
+    if err:
+        return None, None, _vk_error_text(err)
     if not obj:
-        return None, None, "Не удалось найти сообщество по этой ссылке. Проверь её."
+        return None, None, (
+            f"Не нашёл в VK сообщества «{raw}». Проверь ссылку — "
+            "или пришли ссылку вида vk.com/club123."
+        )
     obj_type = obj.get("type")
-    if obj_type not in ("group", "page"):
+    if obj_type not in _VK_COMMUNITY_TYPES:
         human = {"user": "страница пользователя", "application": "приложение"}.get(obj_type, obj_type)
         return None, None, f"Это не сообщество, а {human}. Пришли ссылку именно на группу/паблик VK."
-    gid = int(obj["object_id"])
-    return gid, fetch_vk_group_name(vk_token, gid), None
+    return by_id(int(obj["object_id"]))
 
 
 def fetch_vk_group_name(vk_token: str, group_id: int) -> str | None:
     """Пробует получить название группы через VK API. None — если не удалось."""
-    try:
-        resp = requests.get(
-            "https://api.vk.com/method/groups.getById",
-            params={
-                "access_token": vk_token,
-                "v": VK_API_VERSION,
-                "group_id": group_id,
-            },
-            timeout=15,
-        ).json()
-    except Exception:
-        logger.exception("Ошибка запроса groups.getById")
-        return None
-
-    if "error" in resp:
-        logger.info("groups.getById error: %s", resp["error"])
-        return None
-
-    response = resp.get("response")
-    try:
-        if isinstance(response, list):
-            return response[0]["name"]
-        if isinstance(response, dict):
-            return response["groups"][0]["name"]
-    except (KeyError, IndexError, TypeError):
-        pass
-    return None
+    response, _ = _vk_call("groups.getById", vk_token, group_id=group_id)
+    group = _first_group(response)
+    return group.get("name") if group else None
 
 
 class _PlatformUrlFilter(filters.MessageFilter):
     """Пропускает только сообщения, содержащие распознанную ссылку на платформу."""
     def filter(self, message) -> bool:
-        return bool(message.text and detect_platform(message.text.strip()))
+        return extract_platform_url(_message_text(message)) is not None
 
 _URL_FILTER = _PlatformUrlFilter()
 
 
-def upload_to_vk(
+class _VKCommunityLinkFilter(filters.MessageFilter):
+    """Ссылка на VK, но не на видео/клип — т.е. скорее всего на сообщество."""
+    def filter(self, message) -> bool:
+        text = _message_text(message)
+        if "access_token=" in text:  # это ссылка с токеном, а не с сообществом
+            return False
+        return bool(_VK_LINK_RE.search(text)) and extract_platform_url(text) is None
+
+_VK_COMMUNITY_FILTER = _VKCommunityLinkFilter()
+
+
+def _upload_short_video(
     vk_token: str,
-    vk_group_id: int,
+    group_id: int,
+    file_path: str,
+    description: str,
+) -> None:
+    """Публикует видео как VK Клип через shortVideo API (через библиотеку vk_api).
+
+    Последовательность: shortVideo.create → загрузка файла → shortVideo.edit
+    (если есть описание) → polling shortVideo.publish до готовности видео.
+    Бросает VKError при любой ошибке API или превышении попыток ожидания.
+    """
+    try:
+        vk = vk_api.VkApi(token=vk_token, api_version=VK_SHORT_VIDEO_API_VERSION).get_api()
+    except Exception as exc:
+        raise VKError(None, f"ошибка инициализации vk_api: {exc}", stage="vk_api init", network=True) from exc
+
+    # ── Этап 1: shortVideo.create ─────────────────────────────────────────
+    stage = "VK shortVideo.create"
+    try:
+        upload_data = vk.shortVideo.create(
+            group_id=group_id,
+            file_size=os.path.getsize(file_path) // 1024,  # в килобайтах
+        )
+    except ApiError as exc:
+        raise VKError(exc.code, str(exc), stage=stage) from exc
+    except Exception as exc:
+        raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+    logger.info("shortVideo.create response: %s", upload_data)
+
+    upload_url = upload_data["upload_url"]
+    video_id   = upload_data["video_id"]
+    owner_id   = upload_data["owner_id"]
+
+    # ── Этап 2: загрузка файла ────────────────────────────────────────────
+    stage = "загрузка файла shortVideo"
+    try:
+        with open(file_path, "rb") as f:
+            upload_resp = requests.post(upload_url, files={"file": f}, timeout=300)
+            upload_resp.raise_for_status()
+            logger.info("shortVideo upload response: %s", upload_resp.text[:500])
+            upload_info = upload_resp.json()
+            video_id = upload_info.get("video_id", video_id)
+            owner_id = upload_info.get("owner_id", owner_id)
+    except requests.exceptions.RequestException as exc:
+        raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+
+    # ── Этап 3: shortVideo.edit (только если есть описание) ───────────────
+    if description:
+        stage = "VK shortVideo.edit"
+        try:
+            vk.shortVideo.edit(
+                video_id=video_id,
+                owner_id=owner_id,
+                description=description,
+            )
+        except ApiError as exc:
+            raise VKError(exc.code, str(exc), stage=stage) from exc
+        except Exception as exc:
+            raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+
+    # ── Этап 4: polling shortVideo.publish ────────────────────────────────
+    stage = "VK shortVideo.publish"
+    for attempt in range(VK_SHORT_VIDEO_POLL_ATTEMPTS):
+        try:
+            vk.shortVideo.publish(
+                video_id=video_id,
+                owner_id=owner_id,
+                license_agree=1,
+                wallpost=1,
+            )
+            logger.info("shortVideo.publish успешно (попытка %s)", attempt + 1)
+            return
+        except ApiError as exc:
+            if exc.code == 3001:
+                logger.info(
+                    "shortVideo: видео ещё не обработано, ожидание (попытка %s/%s)",
+                    attempt + 1, VK_SHORT_VIDEO_POLL_ATTEMPTS,
+                )
+                time.sleep(VK_SHORT_VIDEO_POLL_INTERVAL)
+                continue
+            raise VKError(exc.code, str(exc), stage=stage) from exc
+        except Exception as exc:
+            raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+
+    raise VKError(
+        3001,
+        f"Видео не обработано после {VK_SHORT_VIDEO_POLL_ATTEMPTS} попыток "
+        f"({VK_SHORT_VIDEO_POLL_ATTEMPTS * VK_SHORT_VIDEO_POLL_INTERVAL:.0f} сек). "
+        "Попробуй увеличить VK_SHORT_VIDEO_POLL_ATTEMPTS.",
+        stage=stage,
+    )
+
+
+def _upload_video_legacy(
+    vk_token: str,
+    group_id: int,
     file_path: str,
     title: str,
     description: str,
 ) -> None:
-    """Загружает видео в VK и сразу публикует запись на стене группы.
+    """Загружает видео через старый API (video.save + wall.post).
 
-    Всегда публикует НЕМЕДЛЕННО — планирование времени делается на стороне
-    бота (job_queue), а не через publish_date в VK API. Это гарантирует, что
-    видео не появится в разделе «Видео» группы раньше времени.
+    Используется как fallback, если shortVideo недоступен или вернул ошибку.
     """
-    group_id = abs(int(vk_group_id))
-    logger.info("upload_to_vk: group_id=%s description=%r", group_id, description)
-
     # ── Этап 1: video.save ────────────────────────────────────────────────
     stage = "VK video.save"
     save_data = {
@@ -404,6 +614,35 @@ def upload_to_vk(
             f"VK {e.get('error_code')}: {e.get('error_msg')}",
             stage=stage,
         )
+
+
+def upload_to_vk(
+    vk_token: str,
+    vk_group_id: int,
+    file_path: str,
+    title: str,
+    description: str,
+) -> None:
+    """Загружает видео в VK и публикует в группе.
+
+    Сначала пробует shortVideo API (видео попадает в Клипы).
+    Если shortVideo вернул ошибку — публикует через video.save + wall.post.
+    """
+    group_id = abs(int(vk_group_id))
+    logger.info("upload_to_vk: group_id=%s description=%r", group_id, description)
+
+    try:
+        _upload_short_video(vk_token, group_id, file_path, description)
+        logger.info("upload_to_vk: опубликовано как Клип (shortVideo)")
+        return
+    except VKError as exc:
+        logger.warning(
+            "shortVideo не удался (код %s, этап %r), переключаюсь на video.save: %s",
+            exc.code, exc.stage, exc,
+        )
+
+    _upload_video_legacy(vk_token, group_id, file_path, title, description)
+    logger.info("upload_to_vk: опубликовано как обычное видео (video.save fallback)")
 
 
 async def _publish_to_vk(
@@ -923,9 +1162,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─── Upload conversation ────────────────────────────────────────────────────
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    url = update.message.text.strip()
-    platform = detect_platform(url)
-    if not platform:
+    found = extract_platform_url(_message_text(update.message))
+    if not found:
         await update.message.reply_text(
             "Не распознал ссылку. Поддерживаются:\n"
             "• TikTok (tiktok.com)\n"
@@ -935,6 +1173,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             "• VK видео и клипы (vk.com/video…, vk.com/clip…)"
         )
         return ConversationHandler.END
+    url, platform = found
 
     telegram_id = update.effective_user.id
     db.ensure_user(telegram_id)
@@ -1156,9 +1395,22 @@ async def settoken_from_button(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     token = update.message.text.strip()
 
+    # Частая ошибка: вставляют всю адресную строку
+    # https://oauth.vk.com/blank.html#access_token=vk1.a...&expires_in=0&user_id=1
+    # Раньше она целиком (длинная, без пробелов) сохранялась как «токен», и потом
+    # все запросы к VK падали — в т.ч. поиск групп по ссылке. Вырезаем сам токен.
+    m = re.search(r"access_token=([^&\s#]+)", token)
+    if m:
+        token = m.group(1)
+    elif _VK_COMMUNITY_FILTER.filter(update.message):
+        # Прислали ссылку на сообщество — видимо, хотят добавить группу.
+        await update.message.reply_text("Ввод токена отменён — это ссылка на сообщество.")
+        await handle_community_link(update, context)
+        return ConversationHandler.END
+
     # Пользователь, видимо, передумал вводить токен и прислал ссылку/нажал кнопку меню —
     # не сохраняем это как токен (фикс бага, когда ссылка попадала в токен).
-    if detect_platform(token) or token in MENU_BUTTON_TEXTS:
+    if extract_platform_url(token) or token in MENU_BUTTON_TEXTS:
         await update.message.reply_text(
             "Похоже, это не VK токен — ввод токена отменён.\n"
             f"Если хотел задать токен, нажми «{BTN_TOKEN}» и пришли его."
@@ -1168,7 +1420,11 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # Новый формат VK токена: vk1.a.XXXX (минимум 20 символов после префикса)
     # Старый формат: длинная строка без пробелов (85+ символов)
     is_new = token.startswith("vk1.a.") and len(token) >= 26
-    is_old = len(token) >= 85 and not any(ch.isspace() for ch in token)
+    is_old = (
+        len(token) >= 85
+        and not any(ch.isspace() for ch in token)
+        and "/" not in token  # ссылка — не токен
+    )
     if not (is_new or is_old):
         await update.message.reply_text(
             "❌ Это не похоже на VK токен.\n\n"
@@ -1247,32 +1503,55 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
-async def groups_add_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
+async def _lookup_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Определяет сообщество по тексту сообщения. Возвращает (group_id, name, error)."""
     vk_token = db.get_vk_token(update.effective_user.id)
-
     loop = asyncio.get_running_loop()
-    group_id, name, error = await loop.run_in_executor(
-        None, resolve_vk_group, vk_token, text
+    return await loop.run_in_executor(
+        None, resolve_vk_group, vk_token, _message_text(update.message)
     )
+
+
+async def _offer_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, name: str | None) -> None:
+    """Запоминает найденное сообщество и предлагает сохранить его кнопками."""
+    context.user_data["pending_group_id"] = group_id
+    context.user_data["pending_group_name"] = name
+    if name:
+        text = f"Нашёл сообщество: «{name}» (id {group_id})\nСохранить с этим именем?"
+        rows = [
+            [InlineKeyboardButton("✅ Сохранить", callback_data="g_confirmname")],
+            [InlineKeyboardButton("✏️ Задать своё имя", callback_data="g_manualname")],
+        ]
+    else:
+        text = (
+            f"Сообщество найдено (id {group_id}), но название получить не удалось.\n"
+            "Задай название вручную:"
+        )
+        rows = [[InlineKeyboardButton("✏️ Ввести название", callback_data="g_manualname")]]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def groups_add_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    found = extract_platform_url(_message_text(update.message))
+    if found and found[1] != "vk":
+        # Прислали ссылку на TikTok/YouTube/… — это видео, а не сообщество VK.
+        await update.message.reply_text(
+            f"Это ссылка на видео {PLATFORM_LABELS[found[1]]}, а не на сообщество VK — "
+            "добавление группы отменено.\nЕсли хотел опубликовать видео, пришли ссылку ещё раз."
+        )
+        return ConversationHandler.END
+
+    group_id, name, error = await _lookup_group(update, context)
     if error:
         await update.message.reply_text(error + "\n\nПопробуй ещё раз или /cancel.")
         return G_ADD_ID
 
-    context.user_data["pending_group_id"] = group_id
-
     if name:
-        context.user_data["pending_group_name"] = name
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Сохранить", callback_data="g_confirmname")],
-            [InlineKeyboardButton("✏️ Задать своё имя", callback_data="g_manualname")],
-        ])
-        await update.message.reply_text(
-            f"Нашёл сообщество: «{name}» (id {group_id})\nСохранить с этим именем?",
-            reply_markup=keyboard,
-        )
+        await _offer_group(update, context, group_id, name)
         return G_ADD_CONFIRM
 
+    context.user_data["pending_group_id"] = group_id
+    context.user_data["pending_group_name"] = None
     await update.message.reply_text(
         f"Сообщество найдено (id {group_id}), но название получить не удалось.\n"
         "Введи название вручную:"
@@ -1280,16 +1559,44 @@ async def groups_add_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return G_ADD_NAME
 
 
+async def handle_community_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ссылка на сообщество, присланная вне диалога добавления группы.
+
+    Раньше такая ссылка молча игнорировалась: если после «➕ Добавить группу»
+    прошло больше 5 минут (conversation_timeout), бот перезапускался (состояние
+    диалогов не сохраняется) или кнопку просто не нажали — бот не отвечал вовсе.
+    Теперь сразу ищем сообщество и предлагаем его сохранить.
+    """
+    telegram_id = update.effective_user.id
+    db.ensure_user(telegram_id)
+    if db.count_groups(telegram_id) >= MAX_GROUPS_PER_USER:
+        await update.message.reply_text(
+            f"❌ Достигнут лимит групп: максимум {MAX_GROUPS_PER_USER}.\n"
+            "Удали ненужные группы, чтобы добавить новые."
+        )
+        return
+    group_id, name, error = await _lookup_group(update, context)
+    if error:
+        await update.message.reply_text(error)
+        return
+    await _offer_group(update, context, group_id, name)
+
+
 async def groups_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     telegram_id = update.effective_user.id
 
-    if query.data == "g_confirmname":
+    if context.user_data.get("pending_group_id") is None:
+        # Кнопка от старого сообщения — данные уже использованы / потеряны.
+        await query.edit_message_text("Это предложение устарело. Пришли ссылку на сообщество ещё раз.")
+        return ConversationHandler.END
+
+    if query.data == "g_confirmname" and context.user_data.get("pending_group_name"):
         db.add_group(
             telegram_id,
-            context.user_data["pending_group_id"],
-            context.user_data["pending_group_name"],
+            context.user_data.pop("pending_group_id"),
+            context.user_data.pop("pending_group_name"),
         )
         await query.edit_message_text(
             "✅ Группа добавлена.\n\nТвои группы VK:",
@@ -1304,11 +1611,12 @@ async def groups_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def groups_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     telegram_id = update.effective_user.id
-    db.add_group(
-        telegram_id,
-        context.user_data["pending_group_id"],
-        update.message.text.strip(),
-    )
+    group_id = context.user_data.pop("pending_group_id", None)
+    context.user_data.pop("pending_group_name", None)
+    if group_id is None:
+        await update.message.reply_text("Не нашёл, какую группу добавлять. Пришли ссылку на сообщество ещё раз.")
+        return ConversationHandler.END
+    db.add_group(telegram_id, group_id, update.message.text.strip())
     await update.message.reply_text(
         "✅ Группа добавлена.\n\nТвои группы VK:",
         reply_markup=build_groups_manage_keyboard(telegram_id),
@@ -1676,6 +1984,10 @@ def main() -> None:
         entry_points=[
             CommandHandler("groups", cmd_groups),
             CallbackQueryHandler(groups_button, pattern=r"^(g_add|g_del_|g_rename_|g_pg_|noop$)"),
+            # Кнопки «Сохранить / Своё имя» — и как entry point: они должны работать
+            # после таймаута диалога и для ссылок, присланных вне диалога
+            # (handle_community_link). Иначе нажатие просто «висело».
+            CallbackQueryHandler(groups_add_confirm, pattern=r"^g_(confirmname|manualname)$"),
         ],
         states={
             G_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_id)],
@@ -1721,6 +2033,9 @@ def main() -> None:
     app.add_handler(templates_conv)
     app.add_handler(upload_conv)
     app.add_handler(CallbackQueryHandler(handle_cancel_upload, pattern="^cancel_upload$"))
+    # Ссылка на сообщество VK вне диалогов — последним, чтобы не перехватывать
+    # текст в активных диалогах (описание / заготовка могут содержать ссылку).
+    app.add_handler(MessageHandler(_VK_COMMUNITY_FILTER & ~filters.COMMAND, handle_community_link))
 
     # Периодическая очистка старых логов ошибок.
     app.job_queue.run_repeating(
