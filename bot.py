@@ -4,7 +4,9 @@ import time
 import random
 import asyncio
 import logging
+import threading
 import traceback as tb_module
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable
@@ -14,16 +16,19 @@ import requests
 import vk_api
 from vk_api.exceptions import ApiError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.error import NetworkError as TelegramNetworkError
+from telegram.error import BadRequest, NetworkError as TelegramNetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ConversationHandler, filters,
-    ContextTypes, PicklePersistence,
+    ContextTypes, PicklePersistence, TypeHandler,
 )
 from dotenv import load_dotenv
 
 import db
-from downloader import detect_platform, download_tiktok, download_likee, download_youtube, download_vk, download_instagram
+from downloader import (
+    detect_platform, download_tiktok, download_likee, download_youtube,
+    download_vk, download_instagram, cleanup_tmp_files,
+)
 
 load_dotenv()
 
@@ -93,6 +98,15 @@ _download_semaphore: asyncio.Semaphore | None = None  # инициализиру
 
 VK_PUBLISH_CONCURRENCY = int(os.getenv("VK_PUBLISH_CONCURRENCY", "1"))
 _vk_publish_semaphores: dict[int, asyncio.Semaphore] = {}
+
+# Отдельный пул потоков для публикаций в VK. Публикация держит поток долго
+# (загрузка файла, ожидание обработки клипа до ~2 мин), и в общем пуле такие
+# задачи могли занять все потоки — тогда «зависали» и короткие операции
+# (поиск группы, проверка токена) у всех пользователей.
+_vk_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv("VK_PUBLISH_THREADS", "16")),
+    thread_name_prefix="vk_publish",
+)
 
 
 async def _download_video(platform: str, url: str, vk_token: str | None = None) -> tuple[str, str]:
@@ -166,12 +180,24 @@ class VKError(RuntimeError):
 
     network=True помечает сетевой сбой (а не ответ VK с error_code) — такие
     ошибки тоже имеет смысл повторять.
+
+    ambiguous=True — запрос на публикацию ушёл, но ответа нет: VK мог уже
+    опубликовать ролик. Такое НЕ повторяем — иначе в группе будет дубль.
     """
 
-    def __init__(self, code: int | None, message: str, *, stage: str | None = None, network: bool = False):
+    def __init__(
+        self,
+        code: int | None,
+        message: str,
+        *,
+        stage: str | None = None,
+        network: bool = False,
+        ambiguous: bool = False,
+    ):
         self.code = code
         self.stage = stage
         self.network = network
+        self.ambiguous = ambiguous
         super().__init__(message)
 
 
@@ -488,18 +514,60 @@ class _VKCommunityLinkFilter(filters.MessageFilter):
 _VK_COMMUNITY_FILTER = _VKCommunityLinkFilter()
 
 
+class UploadCancelled(Exception):
+    """Пользователь нажал «Отменить» — публикацию нужно прервать."""
+
+
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    """Точка отмены внутри потока публикации.
+
+    asyncio-отмена не останавливает код в run_in_executor: поток продолжал бы
+    работу и публиковал ролик, хотя пользователь уже видит «отменено». Поэтому
+    поток сам проверяет флаг между этапами.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise UploadCancelled("публикация отменена пользователем")
+
+
+def _delete_vk_video(vk_token: str, owner_id, video_id) -> None:
+    """Best-effort удаление загруженного, но не опубликованного видео/клипа —
+    чтобы после сбоя или отмены в группе не оставались «висящие» черновики."""
+    try:
+        requests.post(
+            "https://api.vk.com/method/video.delete",
+            data={
+                "access_token": vk_token,
+                "v": VK_API_VERSION,
+                "owner_id": owner_id,
+                "video_id": video_id,
+            },
+            timeout=30,
+        )
+    except Exception:
+        logger.warning("Не удалось удалить черновик видео %s_%s", owner_id, video_id, exc_info=True)
+
+
+def _unexpected_response(stage: str, data) -> VKError:
+    """VK ответил не тем, что мы ждали (нет нужных полей)."""
+    return VKError(None, f"неожиданный ответ VK: {str(data)[:300]}", stage=stage)
+
+
 def _upload_short_video(
     vk_token: str,
     group_id: int,
     file_path: str,
     description: str,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Публикует видео как VK Клип через shortVideo API (через библиотеку vk_api).
 
     Последовательность: shortVideo.create → загрузка файла → shortVideo.edit
     (если есть описание) → polling shortVideo.publish до готовности видео.
-    Бросает VKError при любой ошибке API или превышении попыток ожидания.
+    Бросает VKError при любой ошибке API или превышении попыток ожидания,
+    UploadCancelled — если пользователь отменил публикацию.
+    Если сбой случился после создания клипа — черновик удаляется.
     """
+    _check_cancel(cancel_event)
     try:
         vk = vk_api.VkApi(token=vk_token, api_version=VK_SHORT_VIDEO_API_VERSION).get_api()
     except Exception as exc:
@@ -518,68 +586,93 @@ def _upload_short_video(
         raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
     logger.info("shortVideo.create response: %s", upload_data)
 
-    upload_url = upload_data["upload_url"]
-    video_id   = upload_data["video_id"]
-    owner_id   = upload_data["owner_id"]
-
-    # ── Этап 2: загрузка файла ────────────────────────────────────────────
-    stage = "загрузка файла shortVideo"
     try:
-        with open(file_path, "rb") as f:
-            upload_resp = requests.post(upload_url, files={"file": f}, timeout=300)
-            upload_resp.raise_for_status()
-            logger.info("shortVideo upload response: %s", upload_resp.text[:500])
-            upload_info = upload_resp.json()
-            video_id = upload_info.get("video_id", video_id)
-            owner_id = upload_info.get("owner_id", owner_id)
-    except requests.exceptions.RequestException as exc:
-        raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+        upload_url = upload_data["upload_url"]
+        video_id   = upload_data["video_id"]
+        owner_id   = upload_data["owner_id"]
+    except (KeyError, TypeError) as exc:
+        raise _unexpected_response(stage, upload_data) from exc
 
-    # ── Этап 3: shortVideo.edit (только если есть описание) ───────────────
-    if description:
-        stage = "VK shortVideo.edit"
+    published = False
+    try:
+        # ── Этап 2: загрузка файла ────────────────────────────────────────
+        _check_cancel(cancel_event)
+        stage = "загрузка файла shortVideo"
         try:
-            vk.shortVideo.edit(
-                video_id=video_id,
-                owner_id=owner_id,
-                description=description,
-            )
-        except ApiError as exc:
-            raise VKError(exc.code, str(exc), stage=stage) from exc
-        except Exception as exc:
+            with open(file_path, "rb") as f:
+                upload_resp = requests.post(upload_url, files={"file": f}, timeout=300)
+                upload_resp.raise_for_status()
+                logger.info("shortVideo upload response: %s", upload_resp.text[:500])
+                upload_info = upload_resp.json()
+                video_id = upload_info.get("video_id", video_id)
+                owner_id = upload_info.get("owner_id", owner_id)
+        except requests.exceptions.RequestException as exc:
             raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+        except AttributeError as exc:  # json() вернул не dict
+            raise _unexpected_response(stage, upload_resp.text[:300]) from exc
 
-    # ── Этап 4: polling shortVideo.publish ────────────────────────────────
-    stage = "VK shortVideo.publish"
-    for attempt in range(VK_SHORT_VIDEO_POLL_ATTEMPTS):
-        try:
-            vk.shortVideo.publish(
-                video_id=video_id,
-                owner_id=owner_id,
-                license_agree=1,
-                wallpost=1,
-            )
-            logger.info("shortVideo.publish успешно (попытка %s)", attempt + 1)
-            return
-        except ApiError as exc:
-            if exc.code == 3001:
-                logger.info(
-                    "shortVideo: видео ещё не обработано, ожидание (попытка %s/%s)",
-                    attempt + 1, VK_SHORT_VIDEO_POLL_ATTEMPTS,
+        # ── Этап 3: shortVideo.edit (только если есть описание) ───────────
+        if description:
+            _check_cancel(cancel_event)
+            stage = "VK shortVideo.edit"
+            try:
+                vk.shortVideo.edit(
+                    video_id=video_id,
+                    owner_id=owner_id,
+                    description=description,
                 )
-                time.sleep(VK_SHORT_VIDEO_POLL_INTERVAL)
-                continue
-            raise VKError(exc.code, str(exc), stage=stage) from exc
-        except Exception as exc:
-            raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+            except ApiError as exc:
+                raise VKError(exc.code, str(exc), stage=stage) from exc
+            except Exception as exc:
+                raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
 
-    raise VKError(
-        3001,
-        f"Видео не обработано после {VK_SHORT_VIDEO_POLL_ATTEMPTS} попыток "
-        f"({VK_SHORT_VIDEO_POLL_ATTEMPTS * VK_SHORT_VIDEO_POLL_INTERVAL:.0f} сек). "
-        "Попробуй увеличить VK_SHORT_VIDEO_POLL_ATTEMPTS.",
-        stage=stage,
-    )
+        # ── Этап 4: polling shortVideo.publish ────────────────────────────
+        stage = "VK shortVideo.publish"
+        for attempt in range(VK_SHORT_VIDEO_POLL_ATTEMPTS):
+            _check_cancel(cancel_event)
+            try:
+                vk.shortVideo.publish(
+                    video_id=video_id,
+                    owner_id=owner_id,
+                    license_agree=1,
+                    wallpost=1,
+                )
+                published = True
+                logger.info("shortVideo.publish успешно (попытка %s)", attempt + 1)
+                return
+            except ApiError as exc:
+                if exc.code == 3001:
+                    logger.info(
+                        "shortVideo: видео ещё не обработано, ожидание (попытка %s/%s)",
+                        attempt + 1, VK_SHORT_VIDEO_POLL_ATTEMPTS,
+                    )
+                    # Ждём кусками, чтобы отмена срабатывала быстро.
+                    if cancel_event is not None:
+                        cancel_event.wait(VK_SHORT_VIDEO_POLL_INTERVAL)
+                    else:
+                        time.sleep(VK_SHORT_VIDEO_POLL_INTERVAL)
+                    continue
+                raise VKError(exc.code, str(exc), stage=stage) from exc
+            except Exception as exc:
+                # Запрос на публикацию ушёл, а ответа нет — VK мог уже
+                # опубликовать клип. Повтор или запасной путь дали бы дубль.
+                published = True  # черновик не удаляем: он может быть уже постом
+                raise VKError(
+                    None, f"сетевая ошибка: {exc}", stage=stage, network=True, ambiguous=True,
+                ) from exc
+
+        raise VKError(
+            3001,
+            f"Видео не обработано после {VK_SHORT_VIDEO_POLL_ATTEMPTS} попыток "
+            f"({VK_SHORT_VIDEO_POLL_ATTEMPTS * VK_SHORT_VIDEO_POLL_INTERVAL:.0f} сек). "
+            "Попробуй увеличить VK_SHORT_VIDEO_POLL_ATTEMPTS.",
+            stage=stage,
+        )
+    finally:
+        if not published:
+            # Сбой или отмена после create — клип остался бы черновиком в группе,
+            # а повтор / video.save создали бы ещё одну копию.
+            _delete_vk_video(vk_token, owner_id, video_id)
 
 
 def _upload_video_legacy(
@@ -588,11 +681,13 @@ def _upload_video_legacy(
     file_path: str,
     title: str,
     description: str,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Загружает видео через старый API (video.save + wall.post).
 
     Используется как fallback, если shortVideo недоступен или вернул ошибку.
     """
+    _check_cancel(cancel_event)
     # ── Этап 1: video.save ────────────────────────────────────────────────
     stage = "VK video.save"
     save_data = {
@@ -623,58 +718,60 @@ def _upload_video_legacy(
             stage=stage,
         )
 
-    video_id = save_resp["response"]["video_id"]
-    owner_id = save_resp["response"]["owner_id"]
-    upload_url = save_resp["response"]["upload_url"]
-
-    # ── Этап 2: загрузка файла на upload-сервер ───────────────────────────
-    stage = "загрузка файла в VK"
     try:
-        with open(file_path, "rb") as f:
-            upload_resp = requests.post(upload_url, files={"video_file": f}, timeout=300)
-            upload_resp.raise_for_status()
-            logger.info("video upload response: %s", upload_resp.text[:500])
-    except requests.exceptions.RequestException as exc:
-        raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+        video_id = save_resp["response"]["video_id"]
+        owner_id = save_resp["response"]["owner_id"]
+        upload_url = save_resp["response"]["upload_url"]
+    except (KeyError, TypeError) as exc:
+        raise _unexpected_response(stage, save_resp) from exc
 
-    # ── Этап 3: wall.post (публикация записи на стене) ────────────────────
-    stage = "VK wall.post"
-    wall_params = {
-        "access_token": vk_token,
-        "v": VK_API_VERSION,
-        "owner_id": f"-{group_id}",
-        "message": description,
-        "attachments": f"video{owner_id}_{video_id}",
-        "from_group": 1,
-    }
+    posted = False
     try:
-        wall_resp = requests.post(
-            "https://api.vk.com/method/wall.post", data=wall_params, timeout=30
-        ).json()
-    except requests.exceptions.RequestException as exc:
-        raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
-    logger.info("wall.post response: %s", wall_resp)
-
-    if "error" in wall_resp:
-        e = wall_resp["error"]
+        # ── Этап 2: загрузка файла на upload-сервер ───────────────────────
+        _check_cancel(cancel_event)
+        stage = "загрузка файла в VK"
         try:
-            requests.post(
-                "https://api.vk.com/method/video.delete",
-                data={
-                    "access_token": vk_token,
-                    "v": VK_API_VERSION,
-                    "owner_id": owner_id,
-                    "video_id": video_id,
-                },
-                timeout=30,
+            with open(file_path, "rb") as f:
+                upload_resp = requests.post(upload_url, files={"video_file": f}, timeout=300)
+                upload_resp.raise_for_status()
+                logger.info("video upload response: %s", upload_resp.text[:500])
+        except requests.exceptions.RequestException as exc:
+            raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+
+        # ── Этап 3: wall.post (публикация записи на стене) ────────────────
+        _check_cancel(cancel_event)
+        stage = "VK wall.post"
+        wall_params = {
+            "access_token": vk_token,
+            "v": VK_API_VERSION,
+            "owner_id": f"-{group_id}",
+            "message": description,
+            "attachments": f"video{owner_id}_{video_id}",
+            "from_group": 1,
+        }
+        try:
+            wall_resp = requests.post(
+                "https://api.vk.com/method/wall.post", data=wall_params, timeout=30
+            ).json()
+        except requests.exceptions.RequestException as exc:
+            # Пост мог уже появиться — не удаляем видео и не повторяем.
+            posted = True
+            raise VKError(
+                None, f"сетевая ошибка: {exc}", stage=stage, network=True, ambiguous=True,
+            ) from exc
+        logger.info("wall.post response: %s", wall_resp)
+
+        if "error" in wall_resp:
+            e = wall_resp["error"]
+            raise VKError(
+                e.get("error_code"),
+                f"VK {e.get('error_code')}: {e.get('error_msg')}",
+                stage=stage,
             )
-        except Exception:
-            logger.exception("Не удалось откатить видео")
-        raise VKError(
-            e.get("error_code"),
-            f"VK {e.get('error_code')}: {e.get('error_msg')}",
-            stage=stage,
-        )
+        posted = True
+    finally:
+        if not posted:
+            _delete_vk_video(vk_token, owner_id, video_id)
 
 
 def upload_to_vk(
@@ -683,6 +780,7 @@ def upload_to_vk(
     file_path: str,
     title: str,
     description: str,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Загружает видео в VK и публикует в группе.
 
@@ -693,20 +791,21 @@ def upload_to_vk(
     logger.info("upload_to_vk: group_id=%s description=%r", group_id, description)
 
     try:
-        _upload_short_video(vk_token, group_id, file_path, description)
+        _upload_short_video(vk_token, group_id, file_path, description, cancel_event=cancel_event)
         logger.info("upload_to_vk: опубликовано как Клип (shortVideo)")
         return
     except VKError as exc:
-        if _is_network_error(exc):
-            # VK не отвечает — video.save упрётся в тот же таймаут. Отдаём ошибку
-            # наверх: _publish_to_vk повторит попытку и сообщит пользователю.
+        if exc.ambiguous or _is_network_error(exc):
+            # ambiguous — клип мог уже выйти, запасной путь дал бы дубль.
+            # Сеть — video.save упрётся в тот же таймаут; _publish_to_vk
+            # повторит попытку и сообщит пользователю.
             raise
         logger.warning(
             "shortVideo не удался (код %s, этап %r), переключаюсь на video.save: %s",
             exc.code, exc.stage, exc,
         )
 
-    _upload_video_legacy(vk_token, group_id, file_path, title, description)
+    _upload_video_legacy(vk_token, group_id, file_path, title, description, cancel_event=cancel_event)
     logger.info("upload_to_vk: опубликовано как обычное видео (video.save fallback)")
 
 
@@ -718,11 +817,14 @@ async def _publish_to_vk(
     title: str,
     description: str,
     on_retry: Callable[[str], Awaitable[None]] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Публикует видео в VK с ограничением одновременности и ретраями.
 
     on_retry(text) — вызывается перед каждой повторной попыткой с текстом для
     пользователя (например, «сервер VK не отвечает, повторю через …»).
+    cancel_event — флаг отмены: при отмене корутины он взводится, и поток
+    публикации останавливается на ближайшей контрольной точке.
 
     - семафор на пользователя: запросы одного юзера к VK не идут лавиной, даже
       если в один слот попало много его роликов — они выстраиваются в очередь.
@@ -738,13 +840,23 @@ async def _publish_to_vk(
         async with semaphore:
             try:
                 await loop.run_in_executor(
-                    None,
-                    lambda: upload_to_vk(vk_token, vk_group_id, file_path, title, description),
+                    _vk_executor,
+                    lambda: upload_to_vk(
+                        vk_token, vk_group_id, file_path, title, description,
+                        cancel_event=cancel_event,
+                    ),
                 )
                 return
+            except asyncio.CancelledError:
+                if cancel_event is not None:
+                    cancel_event.set()
+                raise
             except VKError as exc:
                 last_exc = exc
-                retryable = exc.network or exc.code in VK_RETRYABLE_ERROR_CODES
+                retryable = (
+                    (exc.network or exc.code in VK_RETRYABLE_ERROR_CODES)
+                    and not exc.ambiguous  # ролик мог выйти — повтор дал бы дубль
+                )
                 if not retryable or attempt == VK_PUBLISH_RETRIES:
                     raise
 
@@ -770,6 +882,29 @@ async def _publish_to_vk(
         await asyncio.sleep(delay)
 
 
+# Понятные объяснения частых кодов ошибок VK при публикации. Технический
+# текст ошибки по-прежнему сохраняется в /errors.
+_VK_PUBLISH_ERROR_TEXTS = {
+    5: (
+        "VK отклонил токен — он недействителен или истёк.\n"
+        f"Получи новый токен кнопкой «{BTN_TOKEN}» и опубликуй заново."
+    ),
+    6: "VK ограничил частоту запросов. Подожди пару минут и попробуй снова.",
+    9: "VK ограничил количество публикаций (flood control). Попробуй позже.",
+    14: (
+        "VK требует ввести капчу для этого аккаунта. Зайди в VK с браузера, "
+        f"сделай пару действий вручную, затем получи новый токен («{BTN_TOKEN}»)."
+    ),
+    15: "Нет доступа к публикации в этой группе — проверь, что ты её администратор или редактор.",
+    17: f"VK требует подтвердить вход. Зайди в VK с браузера и получи новый токен («{BTN_TOKEN}»).",
+    27: f"Этот токен не подходит — нужен токен пользователя, а не сообщества. Задай его кнопкой «{BTN_TOKEN}».",
+    203: "Нет доступа к группе — проверь, что ты её администратор и группа не заблокирована.",
+    204: "Нет прав на загрузку видео в эту группу — проверь права администратора.",
+    214: "Публикация на стене этой группы запрещена — проверь настройки стены.",
+    3001: "VK слишком долго обрабатывает ролик. Попробуй опубликовать ещё раз чуть позже.",
+}
+
+
 def _format_error(
     exc: Exception,
     stage: str | None,
@@ -783,6 +918,14 @@ def _format_error(
     Технические подробности остаются в /errors.
     """
     target = f" при публикации в «{group_name}»" if group_name else ""
+    if isinstance(exc, VKError) and exc.ambiguous:
+        return (
+            f"⚠️ VK не ответил на запрос публикации{target}.\n"
+            "Ролик мог успеть выйти — проверь группу, прежде чем публиковать заново "
+            "(повторять автоматически не стал, чтобы не было дубля)."
+        )
+    if isinstance(exc, VKError) and exc.code in _VK_PUBLISH_ERROR_TEXTS:
+        return f"❌ Не удалось{target or ' опубликовать'}.\n\n{_VK_PUBLISH_ERROR_TEXTS[exc.code]}"
     if _is_network_error(exc):
         if stage == "скачивание" and platform and not isinstance(exc, VKError):
             service = PLATFORM_LABELS.get(platform, platform)
@@ -821,6 +964,19 @@ def _record_error(
     )
 
 
+async def _notify(bot_, chat_id: int, text: str, **kwargs) -> None:
+    """Best-effort сообщение пользователю.
+
+    Сбой отправки в Telegram (таймаут, пользователь заблокировал бота) не должен
+    обрывать публикацию в VK — раньше из-за неотправленного «Скачиваю…» ролик
+    не публиковался вовсе.
+    """
+    try:
+        await bot_.send_message(chat_id, text, **kwargs)
+    except Exception:
+        logger.warning("Не удалось отправить сообщение chat_id=%s", chat_id, exc_info=True)
+
+
 async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """PTB job: вызывается в момент запланированной публикации.
 
@@ -837,19 +993,22 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     description = data.get("description", "")
     file_path: str | None = None
     stage = "скачивание"
+    # Удалять ли строку из scheduled_posts по завершении. Если бота остановили
+    # посреди СКАЧИВАНИЯ — оставляем, после рестарта публикация восстановится.
+    # Если уже шла публикация — удаляем: ролик мог выйти, повтор дал бы дубль.
+    drop_row = True
 
     try:
         vk_token = db.get_vk_token(telegram_id)
         if not vk_token:
-            await context.bot.send_message(
-                chat_id,
-                f"❌ Не удалось опубликовать в «{group_name}»: VK токен не найден. Задай токен заново.",
+            await _notify(
+                context.bot, chat_id,
+                f"❌ Не удалось опубликовать в «{group_name}»: VK токен не найден. "
+                f"Задай токен кнопкой «{BTN_TOKEN}» и запланируй публикацию заново.",
             )
             return
 
-        await context.bot.send_message(
-            chat_id, f"📥 Скачиваю видео для публикации в «{group_name}»…"
-        )
+        await _notify(context.bot, chat_id, f"📥 Скачиваю видео для публикации в «{group_name}»…")
 
         try:
             file_path, title = await _download_video(platform, url, vk_token)
@@ -859,19 +1018,26 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
         stage = "публикация"
-        await context.bot.send_message(
-            chat_id, f"📤 Публикую в «{group_name}» (id {vk_group_id})…"
-        )
+        await _notify(context.bot, chat_id, f"📤 Публикую в «{group_name}» (id {vk_group_id})…")
 
         async def notify_retry(text: str) -> None:
-            await context.bot.send_message(chat_id, text)
+            await _notify(context.bot, chat_id, text)
 
         await _publish_to_vk(
             telegram_id, vk_token, vk_group_id, file_path, title, description,
             on_retry=notify_retry,
+            cancel_event=threading.Event(),
         )
-        await context.bot.send_message(chat_id, f"✅ Видео опубликовано в «{group_name}»!")
+        await _notify(context.bot, chat_id, f"✅ Видео опубликовано в «{group_name}»!")
 
+    except asyncio.CancelledError:
+        # Бота останавливают посреди работы.
+        drop_row = stage != "скачивание"
+        logger.warning(
+            "Отложенная публикация прервана остановкой бота (этап %s, запись %s)",
+            stage, "удалена" if drop_row else "сохранена для восстановления",
+        )
+        raise
     except Exception as exc:
         logger.exception("Ошибка отложенной публикации chat_id=%s", chat_id)
         stage = exc.stage if isinstance(exc, VKError) else stage
@@ -883,22 +1049,26 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             vk_group_id=vk_group_id,
             vk_group_name=group_name,
         )
-        try:
-            await context.bot.send_message(
-                chat_id,
-                _format_error(exc, stage, group_name, platform) + "\n\nℹ️ Подробности — в /errors",
-            )
-        except Exception:
-            pass
+        await _notify(
+            context.bot, chat_id,
+            _format_error(exc, stage, group_name, platform) + "\n\nℹ️ Подробности — в /errors",
+        )
     finally:
         post_id = data.get("scheduled_post_id")
-        if post_id is not None:
-            db.delete_scheduled_post(post_id)
-        if file_path and os.path.exists(file_path):
+        if post_id is not None and drop_row:
             try:
-                os.remove(file_path)
-            except OSError:
-                pass
+                db.delete_scheduled_post(post_id)
+            except Exception:
+                logger.exception("Не удалось удалить отложенную публикацию #%s из БД", post_id)
+        _remove_file(file_path)
+
+
+def _remove_file(path: str | None) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            logger.warning("Не удалось удалить временный файл %s", path, exc_info=True)
 
 
 async def _restore_scheduled_posts(app: Application) -> None:
@@ -950,6 +1120,16 @@ async def _restore_scheduled_posts(app: Application) -> None:
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
+def _group_label(g) -> str:
+    """Текст кнопки группы. Пустое название (сохранённое до валидации) давало
+    кнопку без текста — Telegram отклонял всю клавиатуру."""
+    return (g["name"] or "").strip() or f"Группа {g['vk_group_id']}"
+
+
+def _template_label(t) -> str:
+    return (t["title"] or "").strip() or f"Заготовка #{t['id']}"
+
+
 def build_time_keyboard() -> InlineKeyboardMarkup:
     now = datetime.now(MOSCOW_TZ)
     today = now.date()
@@ -983,7 +1163,7 @@ def build_groups_select_keyboard(telegram_id: int, page: int = 0) -> InlineKeybo
     start = page * KEYBOARD_PAGE_SIZE
     page_groups = all_groups[start:start + KEYBOARD_PAGE_SIZE]
     rows = [
-        [InlineKeyboardButton(g["name"], callback_data=f"upgroup_{g['id']}")]
+        [InlineKeyboardButton(_group_label(g), callback_data=f"upgroup_{g['id']}")]
         for g in page_groups
     ]
     nav = []
@@ -1002,7 +1182,7 @@ def build_desc_keyboard(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup
     start = page * KEYBOARD_PAGE_SIZE
     page_templates = all_templates[start:start + KEYBOARD_PAGE_SIZE]
     rows = [
-        [InlineKeyboardButton(f"📝 {t['title']}", callback_data=f"updesc_tpl_{t['id']}")]
+        [InlineKeyboardButton(f"📝 {_template_label(t)}", callback_data=f"updesc_tpl_{t['id']}")]
         for t in page_templates
     ]
     nav = []
@@ -1024,7 +1204,7 @@ def build_groups_manage_keyboard(telegram_id: int, page: int = 0) -> InlineKeybo
     page_groups = all_groups[start:start + KEYBOARD_PAGE_SIZE]
     rows = []
     for g in page_groups:
-        rows.append([InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})", callback_data="noop")])
+        rows.append([InlineKeyboardButton(f"{_group_label(g)} (id {g['vk_group_id']})", callback_data="noop")])
         rows.append([
             InlineKeyboardButton("✏️ Переименовать", callback_data=f"g_rename_{g['id']}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"g_del_{g['id']}"),
@@ -1065,7 +1245,7 @@ def build_templates_manage_keyboard(telegram_id: int, page: int = 0) -> InlineKe
     page_templates = all_templates[start:start + KEYBOARD_PAGE_SIZE]
     rows = []
     for t in page_templates:
-        rows.append([InlineKeyboardButton(f"📝 {t['title']}", callback_data="noop")])
+        rows.append([InlineKeyboardButton(f"📝 {_template_label(t)}", callback_data="noop")])
         rows.append([
             InlineKeyboardButton("✏️ Изменить", callback_data=f"t_edit_{t['id']}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"t_del_{t['id']}"),
@@ -1104,13 +1284,28 @@ async def do_upload(
     telegram_id = job.get("telegram_id", chat_id)
     file_path: str | None = None
     stage = "скачивание"
+    cancel_event = threading.Event()
 
     async def set_status(text: str, final: bool = False):
+        """Обновляет статус. Best-effort: сбой Telegram (таймаут, сообщение
+        удалено, «not modified») не должен обрывать саму публикацию."""
+        nonlocal status_message
         markup = None if final else CANCEL_MARKUP
         if status_message:
-            await status_message.edit_text(text, reply_markup=markup)
-        else:
-            await context.bot.send_message(chat_id, text, reply_markup=markup)
+            try:
+                await status_message.edit_text(text, reply_markup=markup)
+                return
+            except BadRequest as exc:
+                if "not modified" in str(exc).lower():
+                    return
+                logger.info("Статусное сообщение недоступно (%s) — шлю новое", exc)
+            except Exception:
+                logger.warning("Не удалось обновить статус chat_id=%s", chat_id, exc_info=True)
+                return
+        try:
+            status_message = await context.bot.send_message(chat_id, text, reply_markup=markup)
+        except Exception:
+            logger.warning("Не удалось отправить статус chat_id=%s", chat_id, exc_info=True)
 
     try:
         await set_status(f"⏳ Скачиваю видео с {PLATFORM_LABELS.get(platform, platform)}...")
@@ -1130,18 +1325,22 @@ async def do_upload(
         await _publish_to_vk(
             telegram_id, vk_token, vk_group_id, file_path, title, description,
             on_retry=set_status,
+            cancel_event=cancel_event,
         )
         await set_status(f"✅ Опубликовано в «{vk_group_name}»!", final=True)
 
-    except asyncio.CancelledError:
-        try:
-            if status_message:
-                await status_message.edit_text("❌ Загрузка отменена")
-            else:
-                await context.bot.send_message(chat_id, "❌ Загрузка отменена")
-        except Exception:
-            pass
-        raise
+    except (asyncio.CancelledError, UploadCancelled) as exc:
+        # Останавливаем поток публикации на ближайшей контрольной точке.
+        cancel_event.set()
+        text = "❌ Загрузка отменена"
+        if stage == "публикация":
+            text += (
+                "\n\nЕсли отмена пришлась на самый последний шаг, VK мог успеть "
+                "опубликовать ролик — проверь группу."
+            )
+        await set_status(text, final=True)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
     except Exception as exc:
         logger.exception("Ошибка обработки %s", url)
         eff_stage = exc.stage if isinstance(exc, VKError) else stage
@@ -1160,11 +1359,7 @@ async def do_upload(
     finally:
         if task_key is not None:
             _upload_tasks.pop(task_key, None)
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
+        _remove_file(file_path)
 
 
 def _snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -1182,11 +1377,17 @@ def _snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 
 def _start_upload(chat_id: int, context: ContextTypes.DEFAULT_TYPE, status_msg) -> None:
-    """Запускает немедленную публикацию в фоне — диспетчер бота не блокируется."""
+    """Запускает немедленную публикацию в фоне — диспетчер бота не блокируется.
+
+    application.create_task, а не asyncio.create_task: исключения задачи попадают
+    в обработчик ошибок бота (_on_error), а не теряются в консоли с
+    «Task exception was never retrieved».
+    """
     job = _snapshot_job(context)
     task_key = (chat_id, status_msg.message_id)
-    task = asyncio.create_task(
-        do_upload(chat_id, context, job, status_message=status_msg, task_key=task_key)
+    task = context.application.create_task(
+        do_upload(chat_id, context, job, status_message=status_msg, task_key=task_key),
+        name=f"upload_{chat_id}_{status_msg.message_id}",
     )
     _upload_tasks[task_key] = task
 
@@ -1308,9 +1509,24 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return UP_GROUP
 
 
+def _own_group(group_row_id: int, telegram_id: int):
+    """Группа из БД, только если она принадлежит этому пользователю.
+
+    id строки приходит из callback_data, а её можно подделать — без проверки
+    владельца можно было удалить/переименовать/выбрать чужую группу."""
+    group = db.get_group(group_row_id)
+    return group if group and group["telegram_id"] == telegram_id else None
+
+
+def _own_template(template_id: int, telegram_id: int):
+    """Заготовка из БД, только если она принадлежит этому пользователю."""
+    template = db.get_template(template_id)
+    return template if template and template["telegram_id"] == telegram_id else None
+
+
 async def handle_group_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     if query.data.startswith("upgroup_pg_"):
         page = int(query.data[len("upgroup_pg_"):])
@@ -1323,7 +1539,7 @@ async def handle_group_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
         return UP_GROUP
 
     group_row_id = int(query.data.split("_")[1])
-    group = db.get_group(group_row_id)
+    group = _own_group(group_row_id, update.effective_user.id)
     if not group:
         await query.edit_message_text("Группа не найдена. Начни заново — пришли ссылку.")
         return ConversationHandler.END
@@ -1340,7 +1556,7 @@ async def handle_group_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_desc_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
 
     if data.startswith("updesc_pg_"):
@@ -1361,8 +1577,15 @@ async def handle_desc_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["description"] = ""
     else:  # updesc_tpl_<id>
         template_id = int(data.rsplit("_", 1)[1])
-        template = db.get_template(template_id)
-        context.user_data["description"] = template["body"] if template else ""
+        template = _own_template(template_id, update.effective_user.id)
+        if template is None:
+            # Заготовку удалили, пока выбирали — раньше молча уходило пустое описание.
+            await query.edit_message_text(
+                "⚠️ Эта заготовка уже удалена. Выбери другое описание:",
+                reply_markup=build_desc_keyboard(update.effective_user.id),
+            )
+            return UP_DESC
+        context.user_data["description"] = template["body"]
 
     await query.edit_message_text("Когда опубликовать видео?", reply_markup=build_time_keyboard())
     return UP_TIME
@@ -1376,7 +1599,7 @@ async def handle_custom_desc(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_time_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
     chat_id = query.message.chat_id
 
@@ -1420,7 +1643,7 @@ async def handle_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer("Отмена...")
+    await _safe_answer(query, "Отмена...")
     # Кнопка «Отмена» висит на том же сообщении, по которому задача и ключуется.
     # Ключ — (chat_id, message_id): message_id уникален лишь внутри чата, поэтому
     # без chat_id отмена одного юзера могла бы попасть в чужую загрузку.
@@ -1472,7 +1695,7 @@ async def show_token_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_token_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer("Токен удалён")
+    await _safe_answer(query, "Токен удалён")
     db.clear_vk_token(update.effective_user.id)
     await query.edit_message_text("🗑 Токен удалён.", reply_markup=build_token_keyboard(False))
 
@@ -1496,7 +1719,7 @@ async def cmd_settoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def settoken_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     await query.edit_message_text(SETTOKEN_PROMPT)
     return TOKEN_WAIT
 
@@ -1544,8 +1767,36 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return TOKEN_WAIT
 
+    # Проверяем токен сразу, а не при первой публикации (которая может быть
+    # отложенной на завтра — и тогда пользователь узнает о проблеме слишком поздно).
+    await update.message.reply_text("⏳ Проверяю токен в VK…")
+    loop = asyncio.get_running_loop()
+    response, err = await loop.run_in_executor(None, lambda: _vk_call("users.get", token))
+
+    if err and err.get("error_code") in (5, 1116):
+        await update.message.reply_text(
+            "❌ VK отклонил этот токен — он недействителен или уже истёк.\n"
+            "Получи новый по инструкции выше и пришли его, или нажми /cancel."
+        )
+        return TOKEN_WAIT
+
     db.set_vk_token(update.effective_user.id, token)
-    await update.message.reply_text("✅ Токен сохранён.", reply_markup=main_keyboard())
+    if err:
+        note = (
+            _unreachable_text("VK") if err.get("error_code") is None
+            else f"VK вернул ошибку {err.get('error_code')}: {err.get('error_msg')}"
+        )
+        text = f"✅ Токен сохранён, но проверить его сейчас не получилось.\n\n{note}"
+    elif isinstance(response, list) and response:
+        user = response[0]
+        who = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        text = "✅ Токен сохранён и проверен" + (f" (аккаунт: {who})." if who else ".")
+    else:
+        text = (
+            "✅ Токен сохранён, но VK не вернул данные пользователя — похоже, это токен "
+            "сообщества. Для публикации клипов нужен токен пользователя (по инструкции выше)."
+        )
+    await update.message.reply_text(text, reply_markup=main_keyboard())
     return ConversationHandler.END
 
 
@@ -1563,11 +1814,11 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     data = query.data
 
     if data == "noop":
-        await query.answer()
+        await _safe_answer(query)
         return ConversationHandler.END
 
     if data.startswith("g_pg_"):
-        await query.answer()
+        await _safe_answer(query)
         page = int(data[len("g_pg_"):])
         await query.edit_message_text(
             "Твои группы VK:",
@@ -1576,7 +1827,7 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     if data == "g_add":
-        await query.answer()
+        await _safe_answer(query)
         if db.count_groups(update.effective_user.id) >= MAX_GROUPS_PER_USER:
             await query.edit_message_text(
                 f"❌ Достигнут лимит групп: максимум {MAX_GROUPS_PER_USER}.\n"
@@ -1594,8 +1845,12 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return G_ADD_ID
 
     if data.startswith("g_del_"):
-        await query.answer("Удалено")
-        db.delete_group(int(data.rsplit("_", 1)[1]))
+        group = _own_group(int(data.rsplit("_", 1)[1]), update.effective_user.id)
+        if group:
+            db.delete_group(group["id"])
+            await _safe_answer(query, "Удалено")
+        else:
+            await _safe_answer(query, "Группа уже удалена")
         await query.edit_message_text(
             "Твои группы VK:",
             reply_markup=build_groups_manage_keyboard(update.effective_user.id),
@@ -1603,12 +1858,16 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     if data.startswith("g_rename_"):
-        await query.answer()
-        context.user_data["rename_group_id"] = int(data.rsplit("_", 1)[1])
+        group = _own_group(int(data.rsplit("_", 1)[1]), update.effective_user.id)
+        if not group:
+            await _safe_answer(query, "Группа не найдена", show_alert=True)
+            return ConversationHandler.END
+        await _safe_answer(query)
+        context.user_data["rename_group_id"] = group["id"]
         await query.edit_message_text("Введи новое название группы:")
         return G_RENAME
 
-    await query.answer()
+    await _safe_answer(query)
     return ConversationHandler.END
 
 
@@ -1702,12 +1961,20 @@ async def handle_community_link(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def groups_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     telegram_id = update.effective_user.id
 
     if context.user_data.get("pending_group_id") is None:
         # Кнопка от старого сообщения — данные уже использованы / потеряны.
         await query.edit_message_text("Это предложение устарело. Пришли ссылку на сообщество ещё раз.")
+        return ConversationHandler.END
+
+    if _group_limit_reached(telegram_id, context.user_data["pending_group_id"]):
+        await query.edit_message_text(
+            f"❌ Достигнут лимит групп: максимум {MAX_GROUPS_PER_USER}.\n"
+            "Удали ненужные группы, чтобы добавить новые.",
+            reply_markup=build_groups_manage_keyboard(telegram_id),
+        )
         return ConversationHandler.END
 
     if query.data == "g_confirmname" and context.user_data.get("pending_group_name"):
@@ -1727,14 +1994,52 @@ async def groups_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return G_ADD_NAME
 
 
+MAX_NAME_LENGTH = 60  # название группы/заготовки — это текст кнопки
+
+
+def _clean_name(text: str | None) -> tuple[str | None, str | None]:
+    """Проверяет название группы/заготовки. Возвращает (name, error).
+
+    Пустое название (из одних пробелов) давало кнопку с пустым текстом —
+    Telegram такую отклоняет, и меню «Группы»/«Описания» переставало открываться.
+    """
+    name = " ".join((text or "").split())
+    if not name:
+        return None, "Название не может быть пустым. Введи название ещё раз:"
+    if len(name) > MAX_NAME_LENGTH:
+        return None, (
+            f"Слишком длинное название ({len(name)} симв.) — максимум {MAX_NAME_LENGTH}. "
+            "Введи покороче:"
+        )
+    return name, None
+
+
+def _group_limit_reached(telegram_id: int, vk_group_id: int) -> bool:
+    """Лимит групп достигнут (повторное добавление той же группы — не новая)."""
+    groups = db.get_groups(telegram_id)
+    if any(g["vk_group_id"] == vk_group_id for g in groups):
+        return False
+    return len(groups) >= MAX_GROUPS_PER_USER
+
+
 async def groups_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     telegram_id = update.effective_user.id
+    name, error = _clean_name(update.message.text)
+    if error:
+        await update.message.reply_text(error)
+        return G_ADD_NAME
     group_id = context.user_data.pop("pending_group_id", None)
     context.user_data.pop("pending_group_name", None)
     if group_id is None:
         await update.message.reply_text("Не нашёл, какую группу добавлять. Пришли ссылку на сообщество ещё раз.")
         return ConversationHandler.END
-    db.add_group(telegram_id, group_id, update.message.text.strip())
+    if _group_limit_reached(telegram_id, group_id):
+        await update.message.reply_text(
+            f"❌ Достигнут лимит групп: максимум {MAX_GROUPS_PER_USER}.\n"
+            "Удали ненужные группы, чтобы добавить новые."
+        )
+        return ConversationHandler.END
+    db.add_group(telegram_id, group_id, name)
     await update.message.reply_text(
         "✅ Группа добавлена.\n\nТвои группы VK:",
         reply_markup=build_groups_manage_keyboard(telegram_id),
@@ -1744,7 +2049,15 @@ async def groups_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def groups_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     telegram_id = update.effective_user.id
-    db.rename_group(context.user_data["rename_group_id"], update.message.text.strip())
+    name, error = _clean_name(update.message.text)
+    if error:
+        await update.message.reply_text(error)
+        return G_RENAME
+    group = _own_group(context.user_data.pop("rename_group_id", -1), telegram_id)
+    if not group:
+        await update.message.reply_text("Группа не найдена — возможно, её уже удалили.")
+        return ConversationHandler.END
+    db.rename_group(group["id"], name)
     await update.message.reply_text(
         "✅ Переименовано.\n\nТвои группы VK:",
         reply_markup=build_groups_manage_keyboard(telegram_id),
@@ -1766,11 +2079,11 @@ async def templates_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = query.data
 
     if data == "noop":
-        await query.answer()
+        await _safe_answer(query)
         return ConversationHandler.END
 
     if data.startswith("t_pg_"):
-        await query.answer()
+        await _safe_answer(query)
         page = int(data[len("t_pg_"):])
         await query.edit_message_text(
             "Твои заготовки описаний:",
@@ -1779,14 +2092,18 @@ async def templates_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ConversationHandler.END
 
     if data == "t_add":
-        await query.answer()
+        await _safe_answer(query)
         context.user_data.pop("edit_template_id", None)
         await query.edit_message_text("Введи название заготовки (короткое, для себя):")
         return T_TITLE
 
     if data.startswith("t_del_"):
-        await query.answer("Удалено")
-        db.delete_template(int(data.rsplit("_", 1)[1]))
+        template = _own_template(int(data.rsplit("_", 1)[1]), update.effective_user.id)
+        if template:
+            db.delete_template(template["id"])
+            await _safe_answer(query, "Удалено")
+        else:
+            await _safe_answer(query, "Заготовка уже удалена")
         await query.edit_message_text(
             "Твои заготовки описаний:",
             reply_markup=build_templates_manage_keyboard(update.effective_user.id),
@@ -1794,28 +2111,43 @@ async def templates_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ConversationHandler.END
 
     if data.startswith("t_edit_"):
-        await query.answer()
-        template_id = int(data.rsplit("_", 1)[1])
-        context.user_data["edit_template_id"] = template_id
+        template = _own_template(int(data.rsplit("_", 1)[1]), update.effective_user.id)
+        if not template:
+            await _safe_answer(query, "Заготовка не найдена", show_alert=True)
+            return ConversationHandler.END
+        await _safe_answer(query)
+        context.user_data["edit_template_id"] = template["id"]
         await query.edit_message_text("Введи новое название заготовки:")
         return T_TITLE
 
-    await query.answer()
+    await _safe_answer(query)
     return ConversationHandler.END
 
 
 async def templates_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["template_title"] = update.message.text.strip()
+    title, error = _clean_name(update.message.text)
+    if error:
+        await update.message.reply_text(error)
+        return T_TITLE
+    context.user_data["template_title"] = title
     await update.message.reply_text("Теперь введи текст описания:")
     return T_BODY
 
 
 async def templates_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     telegram_id = update.effective_user.id
-    title = context.user_data["template_title"]
-    body = update.message.text
+    title = context.user_data.get("template_title")
+    body = update.message.text or ""
+    if not title:
+        await update.message.reply_text("Потерялось название заготовки — начни заново через «📝 Описания».")
+        return ConversationHandler.END
+    if not body.strip():
+        await update.message.reply_text("Текст описания не может быть пустым. Введи текст:")
+        return T_BODY
 
     edit_id = context.user_data.get("edit_template_id")
+    if edit_id and not _own_template(edit_id, telegram_id):
+        edit_id = None  # заготовку удалили, пока редактировали — сохраним как новую
     if edit_id:
         db.update_template(edit_id, title, body)
         msg = "✅ Заготовка обновлена."
@@ -1948,23 +2280,23 @@ async def errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     kind = parts[1]
 
     if kind == "self":
-        await query.answer()
+        await _safe_answer(query)
         text, kb = _own_list_view(uid, int(parts[2]))
         await query.edit_message_text(text, reply_markup=kb)
 
     elif kind == "au":  # admin: список пользователей
         if not is_admin:
-            await query.answer("Недостаточно прав", show_alert=True)
+            await _safe_answer(query, "Недостаточно прав", show_alert=True)
             return
-        await query.answer()
+        await _safe_answer(query)
         text, kb = _admin_users_view(int(parts[2]))
         await query.edit_message_text(text, reply_markup=kb)
 
     elif kind == "u":  # admin: ошибки конкретного пользователя (err_u_<tgid>_<page>)
         if not is_admin:
-            await query.answer("Недостаточно прав", show_alert=True)
+            await _safe_answer(query, "Недостаточно прав", show_alert=True)
             return
-        await query.answer()
+        await _safe_answer(query)
         text, kb = _admin_user_errors_view(int(parts[2]), int(parts[3]))
         await query.edit_message_text(text, reply_markup=kb)
 
@@ -1972,12 +2304,12 @@ async def errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         eid = int(parts[2])
         e = db.get_error(eid)
         if not e:
-            await query.answer("Ошибка не найдена", show_alert=True)
+            await _safe_answer(query, "Ошибка не найдена", show_alert=True)
             return
         if not is_admin and e["telegram_id"] != uid:
-            await query.answer("Недостаточно прав", show_alert=True)
+            await _safe_answer(query, "Недостаточно прав", show_alert=True)
             return
-        await query.answer()
+        await _safe_answer(query)
         text, kb = _detail_view(e, is_admin)
         await query.edit_message_text(text, reply_markup=kb)
 
@@ -1985,16 +2317,33 @@ async def errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         eid = int(parts[2])
         e = db.get_error(eid)
         if not e:
-            await query.answer("Ошибка не найдена", show_alert=True)
+            await _safe_answer(query, "Ошибка не найдена", show_alert=True)
             return
         if not is_admin and e["telegram_id"] != uid:
-            await query.answer("Недостаточно прав", show_alert=True)
+            await _safe_answer(query, "Недостаточно прав", show_alert=True)
             return
-        await query.answer()
+        await _safe_answer(query)
         content = e["traceback"] or e["message"] or "—"
         bio = BytesIO(content.encode("utf-8"))
         bio.name = f"error_{eid}.txt"
         await query.message.reply_document(document=bio, filename=f"error_{eid}.txt")
+
+
+TMP_MAX_AGE_HOURS = float(os.getenv("TMP_MAX_AGE_HOURS", "6"))
+
+
+async def _cleanup_tmp_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет забытые временные файлы скачивания старше TMP_MAX_AGE_HOURS."""
+    loop = asyncio.get_running_loop()
+    try:
+        removed = await loop.run_in_executor(
+            None, cleanup_tmp_files, TMP_MAX_AGE_HOURS * 3600
+        )
+    except Exception:
+        logger.exception("Очистка временных файлов не удалась")
+        return
+    if removed:
+        logger.info("Очистка временных файлов: удалено %s объектов", removed)
 
 
 async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2007,6 +2356,34 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Глобальный обработчик ошибок ─────────────────────────────────────────────
 
+_HARMLESS_BAD_REQUEST_MARKERS = (
+    "message is not modified",      # повторное нажатие той же кнопки / страницы
+    "query is too old",             # ответ на старую кнопку (после рестарта/паузы)
+    "query id is invalid",
+    "message to edit not found",    # сообщение уже удалено
+)
+
+
+def _is_harmless_telegram_error(exc: BaseException | None) -> bool:
+    return isinstance(exc, BadRequest) and any(
+        marker in str(exc).lower() for marker in _HARMLESS_BAD_REQUEST_MARKERS
+    )
+
+
+async def _safe_answer(query, *args, **kwargs) -> None:
+    """query.answer(), который не роняет обработчик.
+
+    На старой кнопке Telegram отвечает «Query is too old» — раньше обработчик
+    падал на первой же строке и не выполнял само действие (удалить, выбрать…).
+    """
+    try:
+        await query.answer(*args, **kwargs)
+    except BadRequest as exc:
+        logger.info("query.answer не прошёл: %s", exc)
+    except TelegramNetworkError:
+        logger.info("query.answer: сеть до Telegram", exc_info=True)
+
+
 async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Непойманные исключения из обработчиков.
 
@@ -2014,10 +2391,18 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     не получает ответа. Пишем в /errors и сообщаем пользователю, что случилось.
     """
     exc = context.error
+    if _is_harmless_telegram_error(exc):
+        # «Сообщение не изменилось», «кнопка устарела» — не ошибка для пользователя.
+        logger.info("Игнорирую безобидную ошибку Telegram: %s", exc)
+        return
     logger.error("Необработанная ошибка при обработке апдейта", exc_info=exc)
 
     # Не достучались до самого Telegram — сообщить пользователю всё равно не выйдет.
-    if isinstance(exc, TelegramNetworkError) or not isinstance(update, Update):
+    # (BadRequest в PTB — тоже наследник NetworkError, но это ошибка запроса,
+    # о ней пользователю сказать можно и нужно.)
+    if isinstance(exc, TelegramNetworkError) and not isinstance(exc, BadRequest):
+        return
+    if not isinstance(update, Update):
         return
     chat = update.effective_chat
     if chat is None:
@@ -2046,6 +2431,43 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+# ─── Устаревшие кнопки, таймауты диалогов, нетекстовые сообщения ──────────────
+
+# Фото, стикер, голосовое и т.п. — всё, что не текст и не команда.
+_NON_TEXT = ~filters.TEXT & ~filters.COMMAND
+
+
+async def _expect_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """В состоянии, где бот ждёт текст, пришло фото/стикер/голосовое.
+
+    Раньше такое сообщение молча игнорировалось. Возврат None — диалог остаётся
+    в текущем состоянии.
+    """
+    await update.message.reply_text(
+        "Я жду текстовое сообщение — напиши текстом или нажми /cancel."
+    )
+
+
+def _timeout_handler(text: str) -> TypeHandler:
+    """Обработчик ConversationHandler.TIMEOUT: сообщает, что диалог закрыт по
+    неактивности (раньше бот молча переставал реагировать на ответы)."""
+    async def on_timeout(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat if isinstance(update, Update) else None
+        if chat is not None:
+            await _notify(context.bot, chat.id, text)
+    return TypeHandler(Update, on_timeout)
+
+
+async def handle_stale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажатие кнопки, которую уже никто не ждёт (диалог истёк по таймауту или
+    бот перезапускался). Раньше кнопка просто «крутилась» без ответа."""
+    await _safe_answer(
+        update.callback_query,
+        "Эта кнопка устарела. Начни заново — например, пришли ссылку ещё раз.",
+        show_alert=True,
+    )
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -2102,6 +2524,7 @@ def main() -> None:
                 # ссылку вместо описания, перезапускаем диалог.
                 MessageHandler(_URL_FILTER, handle_link),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_desc),
+                MessageHandler(_NON_TEXT, _expect_text),
             ],
             UP_TIME: [
                 CallbackQueryHandler(handle_time_choice, pattern=r"^(now|custom|slot_)"),
@@ -2110,7 +2533,12 @@ def main() -> None:
             UP_CUSTOM_TIME: [
                 MessageHandler(_URL_FILTER, handle_link),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_time),
+                MessageHandler(_NON_TEXT, _expect_text),
             ],
+            ConversationHandler.TIMEOUT: [_timeout_handler(
+                "⌛ Время на выбор вышло — публикация не запланирована.\n"
+                "Пришли ссылку на видео ещё раз, чтобы начать заново."
+            )],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_message=False,
@@ -2125,7 +2553,15 @@ def main() -> None:
             CommandHandler("settoken", cmd_settoken),
             CallbackQueryHandler(settoken_from_button, pattern=r"^settoken_change$"),
         ],
-        states={TOKEN_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token)]},
+        states={
+            TOKEN_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token),
+                MessageHandler(_NON_TEXT, _expect_text),
+            ],
+            ConversationHandler.TIMEOUT: [_timeout_handler(
+                f"⌛ Время на ввод токена вышло. Нажми «{BTN_TOKEN}», чтобы задать его."
+            )],
+        },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_message=False,
         conversation_timeout=300,
@@ -2144,10 +2580,23 @@ def main() -> None:
             CallbackQueryHandler(groups_add_confirm, pattern=r"^g_(confirmname|manualname)$"),
         ],
         states={
-            G_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_id)],
+            G_ADD_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_id),
+                MessageHandler(_NON_TEXT, _expect_text),
+            ],
             G_ADD_CONFIRM: [CallbackQueryHandler(groups_add_confirm, pattern=r"^g_(confirmname|manualname)$")],
-            G_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_name)],
-            G_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_rename)],
+            G_ADD_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_name),
+                MessageHandler(_NON_TEXT, _expect_text),
+            ],
+            G_RENAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, groups_rename),
+                MessageHandler(_NON_TEXT, _expect_text),
+            ],
+            ConversationHandler.TIMEOUT: [_timeout_handler(
+                "⌛ Время ожидания вышло. Если добавлял группу — просто пришли ссылку "
+                "на сообщество ещё раз, я её подхвачу."
+            )],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_message=False,
@@ -2163,8 +2612,18 @@ def main() -> None:
             CallbackQueryHandler(templates_button, pattern=r"^(t_add|t_del_|t_edit_|t_pg_|noop$)"),
         ],
         states={
-            T_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, templates_title)],
-            T_BODY: [MessageHandler(filters.TEXT & ~filters.COMMAND, templates_body)],
+            T_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, templates_title),
+                MessageHandler(_NON_TEXT, _expect_text),
+            ],
+            T_BODY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, templates_body),
+                MessageHandler(_NON_TEXT, _expect_text),
+            ],
+            ConversationHandler.TIMEOUT: [_timeout_handler(
+                "⌛ Время на ввод заготовки вышло — она не сохранена. "
+                "Открой «📝 Описания», чтобы начать заново."
+            )],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_message=False,
@@ -2190,8 +2649,21 @@ def main() -> None:
     # Ссылка на сообщество VK вне диалогов — последним, чтобы не перехватывать
     # текст в активных диалогах (описание / заготовка могут содержать ссылку).
     app.add_handler(MessageHandler(_VK_COMMUNITY_FILTER & ~filters.COMMAND, handle_community_link))
+    # Кнопка, которую никто не обработал (диалог истёк / бот перезапускался), —
+    # самым последним: отвечаем «кнопка устарела» вместо вечных «часиков».
+    app.add_handler(CallbackQueryHandler(handle_stale_callback))
     # Любая непойманная ошибка — пользователю сообщение, а не тишина.
     app.add_error_handler(_on_error)
+
+    # Периодическая очистка временных файлов скачивания: остатки от ошибок,
+    # отмен и таймаутов (поток скачивания нельзя прервать — он дописывает файл
+    # уже после того, как задача сдалась).
+    app.job_queue.run_repeating(
+        _cleanup_tmp_job,
+        interval=timedelta(hours=1),
+        first=timedelta(minutes=5),
+        name="cleanup_tmp",
+    )
 
     # Периодическая очистка старых логов ошибок.
     app.job_queue.run_repeating(

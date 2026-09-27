@@ -4,10 +4,13 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import tempfile
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import urllib3
 import yt_dlp
@@ -20,6 +23,21 @@ urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
 
 MAX_VIDEO_DURATION = 180  # секунд (3 минуты)
+# Предел размера файла при прямом скачивании: защита от «бесконечного» ответа
+# и от забивания диска.
+MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_MB", "1024")) * 1024 * 1024
+# Таймаут сокета для yt-dlp: без него «зависшее» соединение держит поток часами.
+YTDLP_SOCKET_TIMEOUT = float(os.getenv("YTDLP_SOCKET_TIMEOUT", "30"))
+
+_TMP_ROOT = os.path.join(tempfile.gettempdir(), "vk_parser_bot")
+
+# Отдельный пул потоков для скачивания. asyncio.wait_for по таймауту не может
+# остановить поток — он докачивает в фоне. В общем пуле такие «зомби» занимали
+# бы потоки, нужные публикации и поиску групп; здесь они ограничены своим пулом.
+_download_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv("DOWNLOAD_CONCURRENCY", "20")),
+    thread_name_prefix="download",
+)
 
 
 # ─── HTTP сессия с ослабленным SSL ───────────────────────────────────────────
@@ -55,9 +73,93 @@ def _make_session() -> Session:
 
 
 def _tmp_path(prefix: str) -> str:
-    d = os.path.join(tempfile.gettempdir(), "vk_parser_bot")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f"{prefix}_{uuid.uuid4().hex}")
+    os.makedirs(_TMP_ROOT, exist_ok=True)
+    return os.path.join(_TMP_ROOT, f"{prefix}_{uuid.uuid4().hex}")
+
+
+def _silent_remove(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        logger.warning("Не удалось удалить %s", path, exc_info=True)
+
+
+def _newest_mtime(path: str) -> float:
+    """Время последнего изменения файла или самого свежего файла в папке."""
+    newest = os.path.getmtime(path)
+    if os.path.isdir(path):
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+                except OSError:
+                    pass
+    return newest
+
+
+def cleanup_tmp_files(max_age_seconds: float) -> int:
+    """Удаляет временные файлы/папки скачивания старше max_age_seconds.
+
+    Подчищает то, что осталось после ошибок, отмен и таймаутов (поток
+    скачивания нельзя прервать, и он дописывает файл уже никому не нужным).
+    Возвращает число удалённых объектов.
+    """
+    if not os.path.isdir(_TMP_ROOT):
+        return 0
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    for name in os.listdir(_TMP_ROOT):
+        path = os.path.join(_TMP_ROOT, name)
+        try:
+            if _newest_mtime(path) >= cutoff:
+                continue
+        except OSError:
+            continue
+        _silent_remove(path)
+        removed += 1
+    return removed
+
+
+def _save_stream(resp, out_path: str, source: str) -> None:
+    """Сохраняет ответ-поток в файл с проверками.
+
+    - Content-Type text/html/json — вместо видео пришла страница ошибки
+      (раньше она сохранялась как .mp4, и VK потом отклонял «видео» с
+      непонятной ошибкой);
+    - размер больше MAX_VIDEO_BYTES — обрываем, чтобы не забить диск;
+    - пустой ответ — тоже ошибка.
+    При любой ошибке недокачанный файл удаляется.
+    """
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if ctype.startswith("text/") or "html" in ctype or "json" in ctype:
+        raise ValueError(
+            f"{source}: вместо видео пришла веб-страница — видео недоступно или ссылка устарела."
+        )
+    length = resp.headers.get("Content-Length") or ""
+    too_big = ValueError(
+        f"{source}: файл слишком большой (больше {MAX_VIDEO_BYTES // (1024 * 1024)} МБ)."
+    )
+    if length.isdigit() and int(length) > MAX_VIDEO_BYTES:
+        raise too_big
+
+    written = 0
+    try:
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                written += len(chunk)
+                if written > MAX_VIDEO_BYTES:
+                    raise too_big
+                f.write(chunk)
+        if written == 0:
+            raise ValueError(f"{source}: сервер вернул пустой файл.")
+    except BaseException:
+        _silent_remove(out_path)
+        raise
 
 
 # ─── Определение платформы ────────────────────────────────────────────────────
@@ -95,59 +197,143 @@ def detect_platform(url: str) -> str | None:
 
 # ─── Универсальный загрузчик через yt-dlp (TikTok, YouTube Shorts) ────────────
 
+# Сетевые сбои НЕ переводим в «понятный» текст здесь — бот сам распознаёт
+# их по тексту ошибки и пишет «сервер … не отвечает».
+_NETWORK_HINTS = (
+    "timed out", "connection refused", "connection reset", "connection aborted",
+    "network is unreachable", "name resolution", "failed to establish",
+    "max retries exceeded", "remote end closed", "temporary failure",
+)
+
+# (признаки в тексте ошибки yt-dlp, понятное объяснение). Порядок важен:
+# более конкретные — раньше.
+_YTDLP_ERROR_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (("private video", "this video is private", "is private"),
+     "Это видео приватное — скачать его нельзя."),
+    (("confirm you're not a bot", "confirm you’re not a bot", "not a bot"),
+     "{label} временно не даёт скачивать с сервера бота (проверка «вы не бот»). "
+     "Попробуй позже или другое видео."),
+    (("sign in to confirm your age", "age-restricted", "age restricted", "inappropriate for some users"),
+     "Видео с ограничением 18+ — без входа в аккаунт его не скачать."),
+    (("login required", "log in", "login_required", "requested content is not available",
+      "cookies"),
+     "{label} требует вход в аккаунт, чтобы открыть это видео — скачать его нельзя."),
+    (("rate-limit", "rate limit", "too many requests", "http error 429"),
+     "{label} временно ограничил скачивание (слишком много запросов). "
+     "Попробуй через несколько минут."),
+    (("not available in your country", "geo restrict", "geo-restrict", "blocked in your country",
+      "not available from your location"),
+     "Видео недоступно в стране, где работает бот."),
+    (("video unavailable", "has been removed", "has been deleted", "does not exist",
+      "http error 404", "no longer available", "not found", "unavailable"),
+     "Видео не найдено — возможно, оно удалено или ссылка неверная."),
+    (("unsupported url",),
+     "Не получилось распознать ссылку — пришли ссылку на конкретное видео."),
+]
+
+
+def _friendly_ytdlp_error(exc: Exception, label: str) -> ValueError | None:
+    """Переводит ошибку yt-dlp в понятный текст. None — оставить как есть
+    (сетевой сбой или неизвестная ошибка)."""
+    text = str(exc).lower()
+    if any(hint in text for hint in _NETWORK_HINTS):
+        return None
+    for markers, message in _YTDLP_ERROR_HINTS:
+        if any(marker in text for marker in markers):
+            return ValueError(message.format(label=label))
+    return None
+
+
+def _ytdlp_download(
+    url: str,
+    save_path: str | None,
+    prefix: str,
+    default_title: str,
+    label: str,
+) -> tuple[str, str]:
+    """Скачивает ролик через yt-dlp. Возвращает (путь к файлу, название).
+
+    Временная папка удаляется всегда — и при успехе (итоговый файл переносится
+    из неё), и при ошибке: раньше .part-файлы, кэш и исходники после
+    перекодирования копились и забивали диск.
+    """
+    own_dir = save_path is None
+    tmpdir = save_path or _tmp_path(f"{prefix}_dir")
+    try:
+        try:
+            # Фаза 1: метаданные без скачивания — проверяем длительность
+            with yt_dlp.YoutubeDL({
+                "quiet": True, "no_warnings": True, "socket_timeout": YTDLP_SOCKET_TIMEOUT,
+            }) as ydl:
+                meta = ydl.extract_info(url, download=False)
+            _check_duration(meta.get("duration"))
+
+            # Фаза 2: скачиваем
+            os.makedirs(tmpdir, exist_ok=True)
+            ydl_opts = {
+                "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                # Приоритет H.264: VK кладёт в «Клипы» только H.264, а источники отдают
+                # высокое разрешение в HEVC/VP9. Берём лучший доступный H.264-вариант.
+                "format_sort": ["vcodec:h264"],
+                "merge_output_format": "mp4",
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": YTDLP_SOCKET_TIMEOUT,
+                "retries": 3,
+                # Отдельный кэш-каталог на каждый вызов — несколько параллельных
+                # загрузок не будут конкурировать за один и тот же кэш-файл.
+                "cachedir": os.path.join(tmpdir, ".cache"),
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                expected = ydl.prepare_filename(info)
+        except yt_dlp.utils.DownloadError as exc:
+            friendly = _friendly_ytdlp_error(exc, label)
+            if friendly is None:
+                raise
+            raise friendly from exc
+
+        title = (info.get("title") or default_title)[:100]
+        # Берём именно тот файл, который yt-dlp считает итоговым, а не первый
+        # попавшийся — это исключает выбор промежуточных .part-файлов.
+        candidate = expected if os.path.isfile(expected) else None
+        if candidate is None:
+            mp4s = sorted(
+                (f for f in os.listdir(tmpdir) if f.endswith(".mp4") and os.path.isfile(os.path.join(tmpdir, f))),
+                key=lambda f: os.path.getsize(os.path.join(tmpdir, f)),
+                reverse=True,
+            )
+            if not mp4s:
+                raise RuntimeError(f"Файл ({prefix}) не был скачан")
+            candidate = os.path.join(tmpdir, mp4s[0])
+
+        if own_dir:
+            # Выносим итоговый файл из временной папки — саму папку удалим ниже.
+            final = _tmp_path(prefix) + os.path.splitext(candidate)[1]
+            shutil.move(candidate, final)
+            candidate = final
+        return _ensure_h264(candidate), title
+    finally:
+        if own_dir:
+            _silent_remove(tmpdir)
+
+
 def _download_ytdlp_sync(
     url: str,
     save_path: str | None,
     prefix: str,
     default_title: str,
 ) -> tuple[str, str]:
-    # Фаза 1: получаем метаданные без скачивания — проверяем длительность
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-        meta = ydl.extract_info(url, download=False)
-    _check_duration(meta.get("duration"))
-
-    # Фаза 2: скачиваем
-    tmpdir = save_path or _tmp_path(f"{prefix}_dir")
-    os.makedirs(tmpdir, exist_ok=True)
-
-    ydl_opts = {
-        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        # Приоритет H.264: VK кладёт в «Клипы» только H.264, а источники отдают
-        # высокое разрешение в HEVC/VP9. Берём лучший доступный H.264-вариант.
-        "format_sort": ["vcodec:h264"],
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        # Отдельный кэш-каталог на каждый вызов — несколько параллельных
-        # загрузок не будут конкурировать за один и тот же кэш-файл.
-        "cachedir": os.path.join(tmpdir, ".cache"),
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        expected = ydl.prepare_filename(info)
-
-    title = (info.get("title") or default_title)[:100]
-    # Берём именно тот файл, который yt-dlp считает итоговым, а не первый
-    # попавшийся — это исключает выбор промежуточных .part-файлов.
-    candidate = expected if os.path.isfile(expected) else None
-    if candidate is None:
-        mp4s = sorted(
-            (f for f in os.listdir(tmpdir) if f.endswith(".mp4") and os.path.isfile(os.path.join(tmpdir, f))),
-            key=lambda f: os.path.getsize(os.path.join(tmpdir, f)),
-            reverse=True,
-        )
-        if not mp4s:
-            raise RuntimeError(f"Файл ({prefix}) не был скачан")
-        candidate = os.path.join(tmpdir, mp4s[0])
-    return _ensure_h264(candidate), title
+    label = {"tiktok": "TikTok", "youtube": "YouTube", "instagram": "Instagram"}.get(prefix, prefix)
+    return _ytdlp_download(url, save_path, prefix, default_title, label)
 
 
 async def download_tiktok(url: str, save_path: str | None = None) -> tuple[str, str]:
     """Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, _download_ytdlp_sync, url, save_path, "tiktok", "TikTok Video"
+        _download_executor, _download_ytdlp_sync, url, save_path, "tiktok", "TikTok Video"
     )
 
 
@@ -157,7 +343,7 @@ async def download_youtube(url: str, save_path: str | None = None) -> tuple[str,
     Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, _download_ytdlp_sync, url, save_path, "youtube", "YouTube Video"
+        _download_executor, _download_ytdlp_sync, url, save_path, "youtube", "YouTube Video"
     )
 
 
@@ -165,7 +351,7 @@ async def download_instagram(url: str, save_path: str | None = None) -> tuple[st
     """Скачивает Instagram Reels через yt-dlp. Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, _download_ytdlp_sync, url, save_path, "instagram", "Instagram Reel"
+        _download_executor, _download_ytdlp_sync, url, save_path, "instagram", "Instagram Reel"
     )
 
 
@@ -193,6 +379,12 @@ def _meta(html: str, prop: str) -> str:
 
 def _get_likee_info_sync(url: str) -> dict:
     resp = _make_session().get(url, headers=_LIKEE_HEADERS, allow_redirects=True, proxies=None, timeout=15)
+    if resp.status_code == 404:
+        raise ValueError("Видео Likee не найдено — возможно, оно удалено или ссылка неверная.")
+    if resp.status_code == 429:
+        raise ValueError("Likee временно ограничил запросы. Попробуй через несколько минут.")
+    if resp.status_code >= 500:
+        raise ValueError(f"Сервер Likee сейчас не работает (ошибка {resp.status_code}). Попробуй позже.")
     html = resp.text
 
     video_url = _meta(html, "og:video:secure_url") or _meta(html, "og:video")
@@ -219,9 +411,7 @@ def _download_likee_sync(url: str) -> tuple[str, str]:
         info["video_url"], headers=_LIKEE_HEADERS, stream=True, proxies=None, timeout=120,
     ) as r:
         r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                f.write(chunk)
+        _save_stream(r, out_path, "Likee")
 
     return _ensure_h264(out_path), info["title"]
 
@@ -229,7 +419,7 @@ def _download_likee_sync(url: str) -> tuple[str, str]:
 async def download_likee(url: str) -> tuple[str, str]:
     """Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _download_likee_sync, url)
+    return await loop.run_in_executor(_download_executor, _download_likee_sync, url)
 
 
 # ─── VK ───────────────────────────────────────────────────────────────────────
@@ -477,40 +667,7 @@ def _download_vk_ytdlp_sync(url: str) -> tuple[str, str]:
     Запасной метод: работает с клипами (HLS), нестандартными видео и любыми
     форматами, которые не поддерживают прямые методы (embed/ajax/api/mobile).
     """
-    # Фаза 1: метаданные без скачивания — проверяем длительность
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-        meta = ydl.extract_info(url, download=False)
-    _check_duration(meta.get("duration"))
-
-    # Фаза 2: скачиваем
-    tmpdir = _tmp_path("vk_dir")
-    os.makedirs(tmpdir, exist_ok=True)
-    ydl_opts = {
-        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        # Приоритет H.264 — чтобы ролик попал в «Клипы», а не в «Видео» VK.
-        "format_sort": ["vcodec:h264"],
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "cachedir": os.path.join(tmpdir, ".cache"),
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        expected = ydl.prepare_filename(info)
-
-    title = (info.get("title") or "VK видео")[:100]
-    candidate = expected if os.path.isfile(expected) else None
-    if candidate is None:
-        mp4s = sorted(
-            (f for f in os.listdir(tmpdir) if f.endswith(".mp4") and os.path.isfile(os.path.join(tmpdir, f))),
-            key=lambda f: os.path.getsize(os.path.join(tmpdir, f)),
-            reverse=True,
-        )
-        if not mp4s:
-            raise RuntimeError("Файл VK (yt-dlp) не был скачан")
-        candidate = os.path.join(tmpdir, mp4s[0])
-    return _ensure_h264(candidate), title
+    return _ytdlp_download(url, None, "vk", "VK видео", "VK")
 
 
 def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
@@ -540,11 +697,10 @@ def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
                 stream=True, timeout=180,
             ) as r:
                 r.raise_for_status()
-                with open(out_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        f.write(chunk)
+                _save_stream(r, out_path, "VK")
             return _ensure_h264(out_path), info["title"]
         except Exception as e:
+            _silent_remove(out_path)
             logger.info("VK: скачивание прямой ссылкой упало (%s), пробую yt-dlp", e)
 
     return _download_vk_ytdlp_sync(url)
@@ -553,4 +709,4 @@ def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
 async def download_vk(url: str, vk_token: str | None = None) -> tuple[str, str]:
     """Возвращает (путь к файлу, название). vk_token улучшает шанс успеха."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _download_vk_sync, url, vk_token)
+    return await loop.run_in_executor(_download_executor, _download_vk_sync, url, vk_token)

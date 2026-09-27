@@ -201,3 +201,100 @@ def test_og_title_not_found():
 def test_og_title_strips_whitespace():
     html = '<meta property="og:title" content="  Trimmed Title  ">'
     assert _og_title(html) == "Trimmed Title"
+
+
+# ─── Понятные ошибки yt-dlp, проверка потока, очистка временных файлов ────────
+
+import os as _os
+import time as _time
+from unittest.mock import MagicMock as _MagicMock
+
+import downloader as _dl
+
+
+@pytest.mark.parametrize("msg,needle", [
+    ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", "приватное"),
+    ("ERROR: [youtube] abc: Sign in to confirm you’re not a bot", "не бот"),
+    ("ERROR: [youtube] abc: Sign in to confirm your age", "18+"),
+    ("ERROR: [Instagram] abc: Requested content is not available, rate-limit reached or login required", "вход"),
+    ("ERROR: [TikTok] 123: HTTP Error 429: Too Many Requests", "ограничил"),
+    ("ERROR: [youtube] abc: Video unavailable", "не найдено"),
+])
+def test_friendly_ytdlp_error(msg, needle):
+    err = _dl._friendly_ytdlp_error(Exception(msg), "YouTube")
+    assert err is not None and needle in str(err)
+
+
+@pytest.mark.parametrize("msg", [
+    "ERROR: Unable to download webpage: The read operation timed out",
+    "ERROR: [tiktok] x: Unable to download: <urlopen error [Errno 111] Connection refused>",
+    "ERROR: something completely unknown",
+])
+def test_friendly_ytdlp_error_keeps_network_and_unknown(msg):
+    assert _dl._friendly_ytdlp_error(Exception(msg), "TikTok") is None
+
+
+def _stream_resp(chunks, ctype="video/mp4", length=None):
+    r = _MagicMock()
+    r.headers = {"Content-Type": ctype}
+    if length is not None:
+        r.headers["Content-Length"] = str(length)
+    r.iter_content.return_value = iter(chunks)
+    return r
+
+
+def test_save_stream_ok(tmp_path):
+    out = tmp_path / "v.mp4"
+    _dl._save_stream(_stream_resp([b"ab", b"cd"]), str(out), "VK")
+    assert out.read_bytes() == b"abcd"
+
+
+def test_save_stream_rejects_html(tmp_path):
+    out = tmp_path / "v.mp4"
+    with pytest.raises(ValueError, match="веб-страница"):
+        _dl._save_stream(_stream_resp([b"<html>"], ctype="text/html; charset=utf-8"), str(out), "VK")
+    assert not out.exists()
+
+
+def test_save_stream_rejects_too_big_by_header(tmp_path, monkeypatch):
+    monkeypatch.setattr(_dl, "MAX_VIDEO_BYTES", 10)
+    with pytest.raises(ValueError, match="слишком большой"):
+        _dl._save_stream(_stream_resp([b"x"], length=11), str(tmp_path / "v.mp4"), "VK")
+
+
+def test_save_stream_rejects_too_big_while_streaming(tmp_path, monkeypatch):
+    monkeypatch.setattr(_dl, "MAX_VIDEO_BYTES", 10)
+    out = tmp_path / "v.mp4"
+    with pytest.raises(ValueError, match="слишком большой"):
+        _dl._save_stream(_stream_resp([b"x" * 6, b"x" * 6]), str(out), "VK")
+    assert not out.exists()
+
+
+def test_save_stream_rejects_empty(tmp_path):
+    out = tmp_path / "v.mp4"
+    with pytest.raises(ValueError, match="пустой"):
+        _dl._save_stream(_stream_resp([]), str(out), "Likee")
+    assert not out.exists()
+
+
+def test_cleanup_tmp_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(_dl, "_TMP_ROOT", str(tmp_path))
+    old_file = tmp_path / "old.mp4"
+    old_file.write_bytes(b"x")
+    old_dir = tmp_path / "tiktok_dir_old"
+    old_dir.mkdir()
+    (old_dir / "a.part").write_bytes(b"x")
+    fresh = tmp_path / "fresh.mp4"
+    fresh.write_bytes(b"x")
+    long_ago = _time.time() - 10 * 3600
+    for p in (old_file, old_dir, old_dir / "a.part"):
+        _os.utime(p, (long_ago, long_ago))
+
+    assert _dl.cleanup_tmp_files(6 * 3600) == 2
+    assert not old_file.exists() and not old_dir.exists()
+    assert fresh.exists()
+
+
+def test_cleanup_tmp_files_missing_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(_dl, "_TMP_ROOT", str(tmp_path / "nope"))
+    assert _dl.cleanup_tmp_files(1) == 0

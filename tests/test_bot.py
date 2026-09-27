@@ -916,7 +916,7 @@ class TestUploadToVk:
         with patch("bot._upload_short_video", side_effect=bot.VKError(1, "err")), \
              patch("bot._upload_video_legacy") as mock_legacy:
             bot.upload_to_vk("mytoken", 999, tmp_video, "MyTitle", "MyDesc")
-        mock_legacy.assert_called_once_with("mytoken", 999, tmp_video, "MyTitle", "MyDesc")
+        mock_legacy.assert_called_once_with("mytoken", 999, tmp_video, "MyTitle", "MyDesc", cancel_event=None)
 
     def test_negative_group_id_normalized(self, tmp_video):
         """Отрицательный vk_group_id нормализуется до abs() перед передачей."""
@@ -937,7 +937,7 @@ class TestUploadToVk:
         """_upload_short_video вызывается с правильными аргументами."""
         with patch("bot._upload_short_video") as mock_short:
             bot.upload_to_vk("mytoken", 42, tmp_video, "Title", "Desc")
-        mock_short.assert_called_once_with("mytoken", 42, tmp_video, "Desc")
+        mock_short.assert_called_once_with("mytoken", 42, tmp_video, "Desc", cancel_event=None)
 
 
 # ─── Распознавание ссылок на сообщества VK ────────────────────────────────────
@@ -1159,9 +1159,9 @@ def test_format_error_download_names_source_platform():
 
 
 def test_format_error_regular_error_unchanged():
-    exc = bot.VKError(15, "VK 15: Access denied", stage="VK wall.post")
+    exc = bot.VKError(100, "VK 100: One of the parameters is invalid", stage="VK wall.post")
     text = bot._format_error(exc, "VK wall.post", "G")
-    assert "VK 15: Access denied" in text and "не отвечает" not in text
+    assert "VK 100: One of the parameters is invalid" in text and "не отвечает" not in text
 
 
 def test_vk_error_text_network():
@@ -1228,3 +1228,331 @@ async def test_on_error_ignores_telegram_network_errors():
     context.bot.send_message = AsyncMock()
     await bot._on_error(MagicMock(spec=bot.Update), context)
     context.bot.send_message.assert_not_awaited()
+
+
+# ─── Надёжность публикации: отмена, дубли, черновики ──────────────────────────
+
+import threading as _threading
+from telegram.error import BadRequest as _BadRequest, TimedOut as _TimedOut, Forbidden as _Forbidden
+
+
+@pytest.fixture
+def tmp_db(tmp_path, monkeypatch):
+    import db
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    db.init_db()
+    return db
+
+
+def test_check_cancel_raises_when_set():
+    ev = _threading.Event()
+    bot._check_cancel(ev)  # не взведён — ок
+    bot._check_cancel(None)
+    ev.set()
+    with pytest.raises(bot.UploadCancelled):
+        bot._check_cancel(ev)
+
+
+def test_short_video_cancel_before_publish_deletes_draft(tmp_video):
+    ev = _threading.Event()
+
+    def upload(*a, **k):
+        ev.set()  # пользователь нажал «Отменить» во время загрузки файла
+        return _mock_resp(_UPLOAD_OK)
+
+    with _vk_mock(create_rv=_CREATE_RESP) as vk, \
+         patch("bot.requests.post", side_effect=upload), \
+         patch.object(bot, "_delete_vk_video") as delete:
+        with pytest.raises(bot.UploadCancelled):
+            bot._upload_short_video("tok", 100, tmp_video, "", cancel_event=ev)
+    vk.shortVideo.publish.assert_not_called()
+    delete.assert_called_once_with("tok", -100, 42)
+
+
+def test_short_video_publish_network_error_is_ambiguous_and_keeps_video(tmp_video):
+    with _vk_mock(create_rv=_CREATE_RESP, publish_se=_requests.exceptions.ReadTimeout("timed out")), \
+         patch("bot.requests.post", return_value=_mock_resp(_UPLOAD_OK)), \
+         patch.object(bot, "_delete_vk_video") as delete:
+        with pytest.raises(bot.VKError) as ei:
+            bot._upload_short_video("tok", 100, tmp_video, "")
+    assert ei.value.ambiguous is True
+    delete.assert_not_called()  # клип мог уже выйти — не трогаем
+
+
+def test_short_video_edit_error_deletes_draft(tmp_video):
+    with _vk_mock(create_rv=_CREATE_RESP, edit_se=_api_err(15)), \
+         patch("bot.requests.post", return_value=_mock_resp(_UPLOAD_OK)), \
+         patch.object(bot, "_delete_vk_video") as delete:
+        with pytest.raises(bot.VKError):
+            bot._upload_short_video("tok", 100, tmp_video, "desc")
+    delete.assert_called_once()
+
+
+def test_short_video_unexpected_create_response(tmp_video):
+    with _vk_mock(create_rv={"something": "else"}):
+        with pytest.raises(bot.VKError) as ei:
+            bot._upload_short_video("tok", 100, tmp_video, "")
+    assert "неожиданный ответ" in str(ei.value)
+    assert ei.value.network is False
+
+
+def test_legacy_unexpected_save_response(tmp_video):
+    with patch("bot.requests.post", return_value=_mock_resp({"response": {}})):
+        with pytest.raises(bot.VKError) as ei:
+            bot._upload_video_legacy("tok", 100, tmp_video, "t", "")
+    assert "неожиданный ответ" in str(ei.value)
+
+
+def test_legacy_wall_post_network_error_is_ambiguous(tmp_video):
+    with patch("bot.requests.post", side_effect=[
+        _mock_resp(_SAVE_OK), _mock_resp({}), _requests.exceptions.ReadTimeout("timed out"),
+    ]), patch.object(bot, "_delete_vk_video") as delete:
+        with pytest.raises(bot.VKError) as ei:
+            bot._upload_video_legacy("tok", 100, tmp_video, "t", "")
+    assert ei.value.ambiguous is True
+    delete.assert_not_called()
+
+
+def test_upload_to_vk_no_fallback_when_ambiguous(tmp_video):
+    err = bot.VKError(None, "x", stage="VK shortVideo.publish", network=True, ambiguous=True)
+    with patch.object(bot, "_upload_short_video", side_effect=err), \
+         patch.object(bot, "_upload_video_legacy") as legacy:
+        with pytest.raises(bot.VKError):
+            bot.upload_to_vk("tok", 1, tmp_video, "t", "")
+    legacy.assert_not_called()
+
+
+async def test_publish_to_vk_does_not_retry_ambiguous(monkeypatch):
+    monkeypatch.setattr(bot, "VK_PUBLISH_RETRIES", 3)
+    err = bot.VKError(None, "x", network=True, ambiguous=True)
+    with patch.object(bot, "upload_to_vk", side_effect=err) as up:
+        with pytest.raises(bot.VKError):
+            await bot._publish_to_vk(999002, "tok", 1, "f", "t", "")
+    assert up.call_count == 1
+
+
+def test_format_error_ambiguous():
+    err = bot.VKError(None, "x", network=True, ambiguous=True)
+    text = bot._format_error(err, "VK shortVideo.publish", "Группа")
+    assert "проверь группу" in text
+
+
+@pytest.mark.parametrize("code,needle", [(5, "токен"), (15, "администратор"), (14, "капч")])
+def test_format_error_known_vk_codes(code, needle):
+    text = bot._format_error(bot.VKError(code, f"VK {code}: x"), "VK wall.post", "G")
+    assert needle in text
+
+
+# ─── Статусы и уведомления не обрывают публикацию ─────────────────────────────
+
+async def test_do_upload_survives_status_edit_failures(monkeypatch, tmp_path):
+    f = tmp_path / "v.mp4"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(bot, "_download_video", AsyncMock(return_value=(str(f), "t")))
+    publish = AsyncMock()
+    monkeypatch.setattr(bot, "_publish_to_vk", publish)
+    status = MagicMock()
+    status.edit_text = AsyncMock(side_effect=_TimedOut())
+    context = MagicMock()
+    context.bot.send_message = AsyncMock(side_effect=_TimedOut())
+    job = {"url": "u", "platform": "tiktok", "vk_token": "t", "vk_group_id": 1, "vk_group_name": "G"}
+    await bot.do_upload(1, context, job, status_message=status)
+    publish.assert_awaited_once()
+    assert not f.exists()
+
+
+async def test_scheduled_job_publishes_even_if_user_blocked_bot(monkeypatch, tmp_path):
+    f = tmp_path / "v.mp4"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(bot.db, "get_vk_token", lambda tid: "tok")
+    deleted = []
+    monkeypatch.setattr(bot.db, "delete_scheduled_post", deleted.append)
+    monkeypatch.setattr(bot, "_download_video", AsyncMock(return_value=(str(f), "t")))
+    publish = AsyncMock()
+    monkeypatch.setattr(bot, "_publish_to_vk", publish)
+    context = MagicMock()
+    context.bot.send_message = AsyncMock(side_effect=_Forbidden("bot was blocked by the user"))
+    context.job.data = {"chat_id": 1, "url": "u", "platform": "tiktok",
+                        "vk_group_id": 5, "vk_group_name": "G", "scheduled_post_id": 77}
+    await bot._scheduled_upload_job(context)
+    publish.assert_awaited_once()
+    assert deleted == [77]
+
+
+async def test_scheduled_job_keeps_row_if_stopped_while_downloading(monkeypatch):
+    monkeypatch.setattr(bot.db, "get_vk_token", lambda tid: "tok")
+    deleted = []
+    monkeypatch.setattr(bot.db, "delete_scheduled_post", deleted.append)
+    monkeypatch.setattr(bot, "_download_video", AsyncMock(side_effect=asyncio.CancelledError()))
+    context = MagicMock()
+    context.bot.send_message = AsyncMock()
+    context.job.data = {"chat_id": 1, "url": "u", "platform": "tiktok",
+                        "vk_group_id": 5, "vk_group_name": "G", "scheduled_post_id": 78}
+    with pytest.raises(asyncio.CancelledError):
+        await bot._scheduled_upload_job(context)
+    assert deleted == []  # восстановится после рестарта
+
+
+async def test_scheduled_job_drops_row_if_stopped_while_publishing(monkeypatch, tmp_path):
+    f = tmp_path / "v.mp4"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(bot.db, "get_vk_token", lambda tid: "tok")
+    deleted = []
+    monkeypatch.setattr(bot.db, "delete_scheduled_post", deleted.append)
+    monkeypatch.setattr(bot, "_download_video", AsyncMock(return_value=(str(f), "t")))
+    monkeypatch.setattr(bot, "_publish_to_vk", AsyncMock(side_effect=asyncio.CancelledError()))
+    context = MagicMock()
+    context.bot.send_message = AsyncMock()
+    context.job.data = {"chat_id": 1, "url": "u", "platform": "tiktok",
+                        "vk_group_id": 5, "vk_group_name": "G", "scheduled_post_id": 79}
+    with pytest.raises(asyncio.CancelledError):
+        await bot._scheduled_upload_job(context)
+    assert deleted == [79]  # ролик мог выйти — повтор после рестарта дал бы дубль
+
+
+# ─── Безобидные ошибки Telegram, устаревшие кнопки ────────────────────────────
+
+@pytest.mark.parametrize("msg,expected", [
+    ("Message is not modified: specified new message content ...", True),
+    ("Query is too old and response timeout expired or query id is invalid", True),
+    ("Text must be non-empty", False),
+])
+def test_is_harmless_telegram_error(msg, expected):
+    assert bot._is_harmless_telegram_error(_BadRequest(msg)) is expected
+
+
+async def test_safe_answer_swallows_old_query():
+    q = MagicMock()
+    q.answer = AsyncMock(side_effect=_BadRequest("Query is too old"))
+    await bot._safe_answer(q)  # не бросает
+
+
+async def test_on_error_ignores_not_modified():
+    context = MagicMock()
+    context.error = _BadRequest("Message is not modified")
+    context.bot.send_message = AsyncMock()
+    await bot._on_error(MagicMock(spec=bot.Update), context)
+    context.bot.send_message.assert_not_awaited()
+
+
+async def test_on_error_reports_real_bad_request(monkeypatch):
+    monkeypatch.setattr(bot, "_record_error", lambda *a, **k: None)
+    update = MagicMock(spec=bot.Update)
+    update.effective_chat.id = 3
+    update.callback_query = None
+    context = MagicMock()
+    context.error = _BadRequest("Text must be non-empty")
+    context.bot.send_message = AsyncMock()
+    await bot._on_error(update, context)
+    context.bot.send_message.assert_awaited_once()
+
+
+async def test_stale_callback_is_answered():
+    update = MagicMock()
+    update.callback_query.answer = AsyncMock()
+    await bot.handle_stale_callback(update, MagicMock())
+    assert "устарела" in update.callback_query.answer.await_args.args[0]
+
+
+# ─── Ввод: названия, владельцы, токен ─────────────────────────────────────────
+
+@pytest.mark.parametrize("text,ok", [
+    ("Моя группа", True), ("  много   пробелов  ", True), ("   ", False), ("", False), (None, False),
+    ("x" * 61, False), ("x" * 60, True),
+])
+def test_clean_name(text, ok):
+    name, error = bot._clean_name(text)
+    assert (name is not None) is ok and (error is None) is ok
+
+
+def test_clean_name_collapses_spaces():
+    assert bot._clean_name("  много   пробелов  ")[0] == "много пробелов"
+
+
+def test_group_label_fallback_for_empty_name(tmp_db):
+    tmp_db.ensure_user(1)
+    tmp_db.add_group(1, 555, "   ")
+    labels = [b.text for row in bot.build_groups_select_keyboard(1).inline_keyboard for b in row]
+    assert labels == ["Группа 555"]
+
+
+def test_own_group_checks_owner(tmp_db):
+    tmp_db.ensure_user(1)
+    tmp_db.ensure_user(2)
+    tmp_db.add_group(1, 100, "A")
+    row_id = tmp_db.get_groups(1)[0]["id"]
+    assert bot._own_group(row_id, 1) is not None
+    assert bot._own_group(row_id, 2) is None
+
+
+async def test_foreign_group_delete_is_ignored(tmp_db):
+    tmp_db.ensure_user(1)
+    tmp_db.ensure_user(2)
+    tmp_db.add_group(1, 100, "A")
+    row_id = tmp_db.get_groups(1)[0]["id"]
+    update = MagicMock()
+    update.effective_user.id = 2  # чужой пользователь
+    update.callback_query.data = f"g_del_{row_id}"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    await bot.groups_button(update, MagicMock())
+    assert len(tmp_db.get_groups(1)) == 1
+
+
+async def test_desc_choice_deleted_template_reprompts(tmp_db):
+    tmp_db.ensure_user(1)
+    update = MagicMock()
+    update.effective_user.id = 1
+    update.callback_query.data = "updesc_tpl_12345"
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    context = MagicMock()
+    context.user_data = {}
+    assert await bot.handle_desc_choice(update, context) == bot.UP_DESC
+    assert "description" not in context.user_data
+
+
+def _token_update(text):
+    u = MagicMock()
+    u.effective_user.id = 1
+    u.message.text = text
+    u.message.entities = []
+    u.message.reply_text = AsyncMock()
+    return u
+
+
+async def test_handle_token_rejects_invalid_token(tmp_db):
+    tmp_db.ensure_user(1)
+    u = _token_update("vk1.a." + "A" * 60)
+    with patch.object(bot, "_vk_call", return_value=(None, {"error_code": 5, "error_msg": "auth"})):
+        state = await bot.handle_token(u, MagicMock())
+    assert state == bot.TOKEN_WAIT
+    assert tmp_db.get_vk_token(1) is None
+
+
+async def test_handle_token_saves_when_vk_unreachable(tmp_db):
+    tmp_db.ensure_user(1)
+    tok = "vk1.a." + "B" * 60
+    u = _token_update(tok)
+    with patch.object(bot, "_vk_call", return_value=(None, {"error_code": None, "error_msg": "timeout"})):
+        await bot.handle_token(u, MagicMock())
+    assert tmp_db.get_vk_token(1) == tok
+    assert "не отвечает" in u.message.reply_text.await_args.args[0]
+
+
+async def test_handle_token_valid(tmp_db):
+    tmp_db.ensure_user(1)
+    u = _token_update("vk1.a." + "C" * 60)
+    with patch.object(bot, "_vk_call", return_value=([{"first_name": "Иван", "last_name": "Петров"}], None)):
+        await bot.handle_token(u, MagicMock())
+    assert "Иван Петров" in u.message.reply_text.await_args.args[0]
+
+
+async def test_rename_rejects_empty_name(tmp_db):
+    tmp_db.ensure_user(1)
+    tmp_db.add_group(1, 100, "A")
+    u = _token_update("   ")
+    context = MagicMock()
+    context.user_data = {"rename_group_id": tmp_db.get_groups(1)[0]["id"]}
+    assert await bot.groups_rename(u, context) == bot.G_RENAME
+    assert tmp_db.get_groups(1)[0]["name"] == "A"
