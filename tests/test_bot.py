@@ -982,19 +982,19 @@ def test_extract_screen_name(text, expected):
     ("-123", 123),
 ])
 def test_resolve_numeric_links_without_token(text, gid):
-    group_id, name, error = bot.resolve_vk_group(None, text)
+    group_id, name, error, _ = bot.resolve_vk_group(None, text)
     assert (group_id, name, error) == (gid, None, None)
 
 
 def test_resolve_short_name_without_token_asks_for_token():
-    group_id, _, error = bot.resolve_vk_group(None, "https://vk.com/mygroup")
+    group_id, _, error, _ = bot.resolve_vk_group(None, "https://vk.com/mygroup")
     assert group_id is None
     assert "токен" in error
 
 
 def test_resolve_short_name_via_groups_getbyid():
     with patch.object(bot, "_vk_call", return_value=({"groups": [{"id": 42, "name": "Моя группа"}]}, None)) as call_:
-        assert bot.resolve_vk_group("tok", "https://vk.ru/mygroup") == (42, "Моя группа", None)
+        assert bot.resolve_vk_group("tok", "https://vk.ru/mygroup") == (42, "Моя группа", None, None)
     call_.assert_called_once_with("groups.getById", "tok", group_id="mygroup")
 
 
@@ -1005,7 +1005,7 @@ def test_resolve_short_name_falls_back_to_resolve_screen_name():
         ({"groups": [{"id": 7, "name": "Встреча"}]}, None),             # имя
     ])
     with patch.object(bot, "_vk_call", side_effect=lambda *a, **k: next(responses)):
-        assert bot.resolve_vk_group("tok", "vk.com/myevent") == (7, "Встреча", None)
+        assert bot.resolve_vk_group("tok", "vk.com/myevent") == (7, "Встреча", None, None)
 
 
 def test_resolve_user_page_rejected():
@@ -1014,21 +1014,21 @@ def test_resolve_user_page_rejected():
         ({"type": "user", "object_id": 1}, None),
     ])
     with patch.object(bot, "_vk_call", side_effect=lambda *a, **k: next(responses)):
-        group_id, _, error = bot.resolve_vk_group("tok", "vk.com/durov")
+        group_id, _, error, _ = bot.resolve_vk_group("tok", "vk.com/durov")
     assert group_id is None
     assert "пользователя" in error
 
 
 def test_resolve_invalid_token_reports_token_problem():
     with patch.object(bot, "_vk_call", return_value=(None, {"error_code": 5, "error_msg": "auth failed"})):
-        group_id, _, error = bot.resolve_vk_group("tok", "vk.com/mygroup")
+        group_id, _, error, _ = bot.resolve_vk_group("tok", "vk.com/mygroup")
     assert group_id is None
     assert "токен" in error
 
 
 def test_resolve_rate_limit_not_reported_as_not_found():
     with patch.object(bot, "_vk_call", return_value=(None, {"error_code": 6, "error_msg": "Too many"})):
-        group_id, _, error = bot.resolve_vk_group("tok", "vk.com/mygroup")
+        group_id, _, error, _ = bot.resolve_vk_group("tok", "vk.com/mygroup")
     assert group_id is None
     assert "частоту" in error
 
@@ -1098,3 +1098,133 @@ def test_community_filter_accepts(text):
 ])
 def test_community_filter_rejects(text):
     assert not bot._VK_COMMUNITY_FILTER.filter(_msg(text))
+
+
+# ─── «Сервер VK не отвечает» — сообщения пользователю ─────────────────────────
+
+def _connect_timeout():
+    return _requests.exceptions.ConnectTimeout(
+        "HTTPSConnectionPool(host='api.vk.com', port=443): Max retries exceeded "
+        "(Caused by ConnectTimeoutError('Connection to api.vk.com timed out.'))"
+    )
+
+
+def _wrapped_network_vkerror():
+    try:
+        try:
+            raise _connect_timeout()
+        except _requests.exceptions.RequestException as exc:
+            raise bot.VKError(None, f"сетевая ошибка: {exc}", stage="VK video.save", network=True) from exc
+    except bot.VKError as err:
+        return err
+
+
+@pytest.mark.parametrize("exc", [
+    _requests.exceptions.ConnectTimeout("x"),
+    _requests.exceptions.ReadTimeout("x"),
+    _requests.exceptions.ConnectionError("x"),
+    TimeoutError("x"),
+    ConnectionResetError("x"),
+    RuntimeError("ERROR: [vk] 1_2: Unable to download webpage: The read operation timed out"),
+])
+def test_is_network_error_true(exc):
+    assert bot._is_network_error(exc) is True
+
+
+def test_is_network_error_follows_cause_chain():
+    assert bot._is_network_error(_wrapped_network_vkerror()) is True
+
+
+@pytest.mark.parametrize("exc", [
+    bot.VKError(15, "VK 15: Access denied", stage="VK wall.post"),
+    bot.VKError(None, "сетевая ошибка: Expecting value", network=True),  # не-JSON ответ
+    ValueError("Видео слишком длинное — 5:01. Максимум 3 минуты."),
+    None,
+])
+def test_is_network_error_false(exc):
+    assert bot._is_network_error(exc) is False
+
+
+def test_format_error_vk_unreachable_is_friendly():
+    text = bot._format_error(_wrapped_network_vkerror(), "VK video.save", "Моя группа", "tiktok")
+    assert "Сервер VK не отвечает" in text
+    assert "Моя группа" in text
+    assert "HTTPSConnectionPool" not in text  # без технической простыни
+
+
+def test_format_error_download_names_source_platform():
+    exc = RuntimeError("Unable to download webpage: connection refused")
+    text = bot._format_error(exc, "скачивание", "G", "tiktok")
+    assert "Сервер TikTok не отвечает" in text
+
+
+def test_format_error_regular_error_unchanged():
+    exc = bot.VKError(15, "VK 15: Access denied", stage="VK wall.post")
+    text = bot._format_error(exc, "VK wall.post", "G")
+    assert "VK 15: Access denied" in text and "не отвечает" not in text
+
+
+def test_vk_error_text_network():
+    assert "Сервер VK не отвечает" in bot._vk_error_text({"error_code": None, "error_msg": "x"})
+
+
+def test_resolve_numeric_id_reports_vk_unreachable():
+    with patch.object(bot, "_vk_call", return_value=(None, {"error_code": None, "error_msg": "timeout"})):
+        group_id, name, error, note = bot.resolve_vk_group("tok", "https://vk.com/club240977878")
+    assert (group_id, name, error) == (240977878, None, None)
+    assert "Сервер VK не отвечает" in note
+
+
+def test_no_name_text_includes_note():
+    text = bot._no_name_text(5, "🌐 Сервер VK не отвечает")
+    assert "id 5" in text and "не отвечает" in text and "Введи название" in text
+
+
+def test_upload_to_vk_skips_legacy_when_vk_unreachable(tmp_video):
+    with patch.object(bot, "_upload_short_video", side_effect=_wrapped_network_vkerror()), \
+         patch.object(bot, "_upload_video_legacy") as legacy:
+        with pytest.raises(bot.VKError):
+            bot.upload_to_vk("tok", 1, tmp_video, "t", "")
+    legacy.assert_not_called()
+
+
+async def test_publish_to_vk_notifies_user_on_retry(monkeypatch):
+    monkeypatch.setattr(bot, "VK_PUBLISH_RETRIES", 2)
+    monkeypatch.setattr(bot, "VK_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(bot.random, "uniform", lambda a, b: 0)
+    calls = iter([_wrapped_network_vkerror(), None])
+
+    def fake_upload(*a, **k):
+        exc = next(calls)
+        if exc:
+            raise exc
+
+    on_retry = AsyncMock()
+    with patch.object(bot, "upload_to_vk", side_effect=fake_upload):
+        await bot._publish_to_vk(999001, "tok", 1, "f", "t", "", on_retry=on_retry)
+    on_retry.assert_awaited_once()
+    assert "Сервер VK не отвечает" in on_retry.await_args.args[0]
+    assert "2 из 2" in on_retry.await_args.args[0]
+
+
+async def test_on_error_notifies_user(monkeypatch):
+    monkeypatch.setattr(bot, "_record_error", lambda *a, **k: None)
+    update = MagicMock(spec=bot.Update)
+    update.effective_chat.id = 42
+    update.effective_user.id = 7
+    update.callback_query = None
+    context = MagicMock()
+    context.error = _connect_timeout()
+    context.bot.send_message = AsyncMock()
+    await bot._on_error(update, context)
+    chat_id, text = context.bot.send_message.await_args.args
+    assert chat_id == 42 and "Сервер VK не отвечает" in text
+
+
+async def test_on_error_ignores_telegram_network_errors():
+    from telegram.error import TimedOut
+    context = MagicMock()
+    context.error = TimedOut()
+    context.bot.send_message = AsyncMock()
+    await bot._on_error(MagicMock(spec=bot.Update), context)
+    context.bot.send_message.assert_not_awaited()

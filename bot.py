@@ -7,12 +7,14 @@ import logging
 import traceback as tb_module
 from io import BytesIO
 from datetime import datetime, timedelta
+from typing import Awaitable, Callable
 
 import pytz
 import requests
 import vk_api
 from vk_api.exceptions import ApiError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.error import NetworkError as TelegramNetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ConversationHandler, filters,
@@ -55,6 +57,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# httpx на уровне INFO пишет каждый запрос к Telegram с полным URL — а в нём
+# токен бота (/bot<TOKEN>/getUpdates). Оставляем только предупреждения.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ─── Состояния разговоров ─────────────────────────────────────────────────────
 
@@ -168,6 +173,51 @@ class VKError(RuntimeError):
         self.stage = stage
         self.network = network
         super().__init__(message)
+
+
+# Признаки «сервер не отвечает» в тексте ошибки — для исключений, которые не
+# сохраняют исходную причину в цепочке (например, DownloadError из yt-dlp).
+_NETWORK_ERROR_MARKERS = (
+    "timed out", "read timeout", "connect timeout", "max retries exceeded",
+    "failed to establish a new connection", "connection refused",
+    "connection reset", "connection aborted", "remotedisconnected",
+    "network is unreachable", "no route to host", "name resolution",
+    "name or service not known", "nodename nor servname",
+)
+
+
+def _is_network_error(exc: BaseException | None) -> bool:
+    """True, если ошибка — «сервер не отвечает / нет соединения», а не ответ сервера.
+
+    Проходит по цепочке причин (raise … from exc), т.к. сетевой сбой обычно
+    завёрнут в VKError / RuntimeError.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        # VKError.network сам по себе не показатель: им помечены и «кривые»
+        # ответы (не-JSON). Смотрим на исходную причину в цепочке.
+        if isinstance(exc, (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            ConnectionError,
+            TimeoutError,
+        )):
+            return True
+        text = str(exc).lower()
+        if any(marker in text for marker in _NETWORK_ERROR_MARKERS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _unreachable_text(service: str = "VK") -> str:
+    return (
+        f"🌐 Сервер {service} не отвечает — не удалось подключиться.\n"
+        f"Скорее всего, это временный сбой на стороне {service} или сети. "
+        "Попробуй ещё раз через несколько минут."
+    )
+
 
 CANCEL_MARKUP = InlineKeyboardMarkup([[
     InlineKeyboardButton("❌ Отменить", callback_data="cancel_upload")
@@ -314,7 +364,7 @@ def _vk_error_text(err: dict) -> str:
     """Понятное пользователю объяснение ошибки VK при поиске сообщества."""
     code = err.get("error_code")
     if code is None:
-        return "Не удалось связаться с VK (ошибка сети). Попробуй ещё раз через минуту."
+        return _unreachable_text("VK")
     if code == 5:
         return (
             "VK отклонил твой токен — он недействителен или истёк.\n"
@@ -342,18 +392,25 @@ def _first_group(response) -> dict | None:
     return None
 
 
-def resolve_vk_group(vk_token: str | None, text: str) -> tuple[int | None, str | None, str | None]:
+def resolve_vk_group(
+    vk_token: str | None, text: str,
+) -> tuple[int | None, str | None, str | None, str | None]:
     """По ссылке/короткому имени/ID определяет группу.
 
-    Возвращает (group_id, name, error). Если group_id is None — в error лежит
-    текст для пользователя, объясняющий, почему не удалось.
+    Возвращает (group_id, name, error, note). Если group_id is None — в error
+    лежит текст для пользователя, объясняющий, почему не удалось. note — пояснение,
+    почему не удалось получить название (группа при этом найдена по id).
     """
     raw = _extract_screen_name(text)
     if not raw:
-        return None, None, "Пустая ссылка. Пришли ссылку на сообщество VK."
+        return None, None, "Пустая ссылка. Пришли ссылку на сообщество VK.", None
 
     def by_id(gid: int):
-        return gid, fetch_vk_group_name(vk_token, gid) if vk_token else None, None
+        if not vk_token:
+            return gid, None, None, None
+        name, err = fetch_vk_group_name(vk_token, gid)
+        note = _vk_error_text(err) if err and not name else None
+        return gid, name, None, note
 
     # wall-1_2 / video-1_2 / clips-1 / album-1_0 … — id группы это число после минуса
     m = _VK_OWNER_SECTION_RE.match(raw)
@@ -374,38 +431,42 @@ def resolve_vk_group(vk_token: str | None, text: str) -> tuple[int | None, str |
         return None, None, (
             "Чтобы добавить группу по короткой ссылке, сначала задай VK токен "
             f"(кнопка «{BTN_TOKEN}»). Либо пришли ссылку вида vk.com/club123."
-        )
+        ), None
 
     # groups.getById принимает и короткие имена: одним запросом получаем и id,
     # и название (меньше запросов — меньше шанс словить лимит VK).
     response, err = _vk_call("groups.getById", vk_token, group_id=raw)
     group = _first_group(response)
     if group and group.get("id"):
-        return int(group["id"]), group.get("name"), None
+        return int(group["id"]), group.get("name"), None, None
     if err and err.get("error_code") in _VK_FATAL_LOOKUP_CODES:
-        return None, None, _vk_error_text(err)
+        return None, None, _vk_error_text(err), None
 
     # Не группа (или VK не отдал её) — выясняем, что это за имя.
     obj, err = _vk_call("utils.resolveScreenName", vk_token, screen_name=raw)
     if err:
-        return None, None, _vk_error_text(err)
+        return None, None, _vk_error_text(err), None
     if not obj:
         return None, None, (
             f"Не нашёл в VK сообщества «{raw}». Проверь ссылку — "
             "или пришли ссылку вида vk.com/club123."
-        )
+        ), None
     obj_type = obj.get("type")
     if obj_type not in _VK_COMMUNITY_TYPES:
         human = {"user": "страница пользователя", "application": "приложение"}.get(obj_type, obj_type)
-        return None, None, f"Это не сообщество, а {human}. Пришли ссылку именно на группу/паблик VK."
+        return None, None, f"Это не сообщество, а {human}. Пришли ссылку именно на группу/паблик VK.", None
     return by_id(int(obj["object_id"]))
 
 
-def fetch_vk_group_name(vk_token: str, group_id: int) -> str | None:
-    """Пробует получить название группы через VK API. None — если не удалось."""
-    response, _ = _vk_call("groups.getById", vk_token, group_id=group_id)
+def fetch_vk_group_name(vk_token: str, group_id: int) -> tuple[str | None, dict | None]:
+    """Пробует получить название группы через VK API.
+
+    Возвращает (name, error): name=None, если не удалось; error — ошибка VK
+    (error_code=None — сервер VK не ответил).
+    """
+    response, err = _vk_call("groups.getById", vk_token, group_id=group_id)
     group = _first_group(response)
-    return group.get("name") if group else None
+    return (group.get("name"), None) if group else (None, err)
 
 
 class _PlatformUrlFilter(filters.MessageFilter):
@@ -636,6 +697,10 @@ def upload_to_vk(
         logger.info("upload_to_vk: опубликовано как Клип (shortVideo)")
         return
     except VKError as exc:
+        if _is_network_error(exc):
+            # VK не отвечает — video.save упрётся в тот же таймаут. Отдаём ошибку
+            # наверх: _publish_to_vk повторит попытку и сообщит пользователю.
+            raise
         logger.warning(
             "shortVideo не удался (код %s, этап %r), переключаюсь на video.save: %s",
             exc.code, exc.stage, exc,
@@ -652,8 +717,12 @@ async def _publish_to_vk(
     file_path: str,
     title: str,
     description: str,
+    on_retry: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     """Публикует видео в VK с ограничением одновременности и ретраями.
+
+    on_retry(text) — вызывается перед каждой повторной попыткой с текстом для
+    пользователя (например, «сервер VK не отвечает, повторю через …»).
 
     - семафор на пользователя: запросы одного юзера к VK не идут лавиной, даже
       если в один слот попало много его роликов — они выстраиваются в очередь.
@@ -686,13 +755,41 @@ async def _publish_to_vk(
             "Публикация в VK не удалась (попытка %s/%s): %s. Повтор через %.1f c",
             attempt, VK_PUBLISH_RETRIES, last_exc, delay,
         )
+        if on_retry is not None:
+            if _is_network_error(last_exc):
+                reason = "🌐 Сервер VK не отвечает."
+            else:
+                reason = "⏳ VK временно ограничил запросы."
+            try:
+                await on_retry(
+                    f"{reason} Повторю попытку через {delay:.0f} с "
+                    f"({attempt + 1} из {VK_PUBLISH_RETRIES})…"
+                )
+            except Exception:
+                logger.debug("on_retry: не удалось уведомить пользователя", exc_info=True)
         await asyncio.sleep(delay)
 
 
-def _format_error(exc: Exception, stage: str | None, group_name: str | None) -> str:
-    """Готовит человекочитаемое сообщение об ошибке для пользователя."""
-    where = f" на этапе «{stage}»" if stage else ""
+def _format_error(
+    exc: Exception,
+    stage: str | None,
+    group_name: str | None,
+    platform: str | None = None,
+) -> str:
+    """Готовит человекочитаемое сообщение об ошибке для пользователя.
+
+    Сетевые сбои («сервер не отвечает») показываем понятным текстом с указанием,
+    чей сервер недоступен: при скачивании — платформы-источника, иначе — VK.
+    Технические подробности остаются в /errors.
+    """
     target = f" при публикации в «{group_name}»" if group_name else ""
+    if _is_network_error(exc):
+        if stage == "скачивание" and platform and not isinstance(exc, VKError):
+            service = PLATFORM_LABELS.get(platform, platform)
+        else:
+            service = "VK"
+        return f"❌ Не удалось{target or ' выполнить действие'}.\n\n{_unreachable_text(service)}"
+    where = f" на этапе «{stage}»" if stage else ""
     return f"❌ Ошибка{where}{target}:\n{exc}"
 
 
@@ -739,6 +836,7 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     vk_group_id = data.get("vk_group_id")
     description = data.get("description", "")
     file_path: str | None = None
+    stage = "скачивание"
 
     try:
         vk_token = db.get_vk_token(telegram_id)
@@ -760,15 +858,23 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"Скачивание заняло больше {DOWNLOAD_TIMEOUT} с — превышен таймаут."
             )
 
+        stage = "публикация"
         await context.bot.send_message(
             chat_id, f"📤 Публикую в «{group_name}» (id {vk_group_id})…"
         )
-        await _publish_to_vk(telegram_id, vk_token, vk_group_id, file_path, title, description)
+
+        async def notify_retry(text: str) -> None:
+            await context.bot.send_message(chat_id, text)
+
+        await _publish_to_vk(
+            telegram_id, vk_token, vk_group_id, file_path, title, description,
+            on_retry=notify_retry,
+        )
         await context.bot.send_message(chat_id, f"✅ Видео опубликовано в «{group_name}»!")
 
     except Exception as exc:
         logger.exception("Ошибка отложенной публикации chat_id=%s", chat_id)
-        stage = exc.stage if isinstance(exc, VKError) else "публикация"
+        stage = exc.stage if isinstance(exc, VKError) else stage
         _record_error(
             telegram_id, exc,
             stage=stage,
@@ -780,7 +886,7 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.send_message(
                 chat_id,
-                _format_error(exc, stage, group_name) + "\n\nℹ️ Подробности — в /errors",
+                _format_error(exc, stage, group_name, platform) + "\n\nℹ️ Подробности — в /errors",
             )
         except Exception:
             pass
@@ -1021,7 +1127,10 @@ async def do_upload(
         await set_status(
             f"📤 Публикую в «{vk_group_name}» (id {vk_group_id})…\nРазмер: {size_mb:.1f} МБ"
         )
-        await _publish_to_vk(telegram_id, vk_token, vk_group_id, file_path, title, description)
+        await _publish_to_vk(
+            telegram_id, vk_token, vk_group_id, file_path, title, description,
+            on_retry=set_status,
+        )
         await set_status(f"✅ Опубликовано в «{vk_group_name}»!", final=True)
 
     except asyncio.CancelledError:
@@ -1045,7 +1154,7 @@ async def do_upload(
             vk_group_name=vk_group_name,
         )
         await set_status(
-            _format_error(exc, eff_stage, vk_group_name) + "\n\nℹ️ Подробности — в /errors",
+            _format_error(exc, eff_stage, vk_group_name, platform) + "\n\nℹ️ Подробности — в /errors",
             final=True,
         )
     finally:
@@ -1504,7 +1613,7 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def _lookup_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Определяет сообщество по тексту сообщения. Возвращает (group_id, name, error)."""
+    """Определяет сообщество по тексту сообщения. Возвращает (group_id, name, error, note)."""
     vk_token = db.get_vk_token(update.effective_user.id)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -1512,7 +1621,22 @@ async def _lookup_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _offer_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: int, name: str | None) -> None:
+def _no_name_text(group_id: int, note: str | None, prompt: str = "Введи название вручную:") -> str:
+    """Сообщение «группа найдена, названия нет» — с причиной, если она известна
+    (например, сервер VK не ответил)."""
+    text = f"Сообщество найдено (id {group_id}), но название получить не удалось."
+    if note:
+        text += f"\n\n{note}"
+    return f"{text}\n\n{prompt}"
+
+
+async def _offer_group(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    group_id: int,
+    name: str | None,
+    note: str | None = None,
+) -> None:
     """Запоминает найденное сообщество и предлагает сохранить его кнопками."""
     context.user_data["pending_group_id"] = group_id
     context.user_data["pending_group_name"] = name
@@ -1523,10 +1647,7 @@ async def _offer_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group
             [InlineKeyboardButton("✏️ Задать своё имя", callback_data="g_manualname")],
         ]
     else:
-        text = (
-            f"Сообщество найдено (id {group_id}), но название получить не удалось.\n"
-            "Задай название вручную:"
-        )
+        text = _no_name_text(group_id, note, "Задай название вручную:")
         rows = [[InlineKeyboardButton("✏️ Ввести название", callback_data="g_manualname")]]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
@@ -1541,7 +1662,7 @@ async def groups_add_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ConversationHandler.END
 
-    group_id, name, error = await _lookup_group(update, context)
+    group_id, name, error, note = await _lookup_group(update, context)
     if error:
         await update.message.reply_text(error + "\n\nПопробуй ещё раз или /cancel.")
         return G_ADD_ID
@@ -1552,10 +1673,7 @@ async def groups_add_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     context.user_data["pending_group_id"] = group_id
     context.user_data["pending_group_name"] = None
-    await update.message.reply_text(
-        f"Сообщество найдено (id {group_id}), но название получить не удалось.\n"
-        "Введи название вручную:"
-    )
+    await update.message.reply_text(_no_name_text(group_id, note))
     return G_ADD_NAME
 
 
@@ -1575,11 +1693,11 @@ async def handle_community_link(update: Update, context: ContextTypes.DEFAULT_TY
             "Удали ненужные группы, чтобы добавить новые."
         )
         return
-    group_id, name, error = await _lookup_group(update, context)
+    group_id, name, error, note = await _lookup_group(update, context)
     if error:
         await update.message.reply_text(error)
         return
-    await _offer_group(update, context, group_id, name)
+    await _offer_group(update, context, group_id, name, note)
 
 
 async def groups_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1887,6 +2005,42 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Очистка логов ошибок: удалено %s записей", deleted)
 
 
+# ─── Глобальный обработчик ошибок ─────────────────────────────────────────────
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Непойманные исключения из обработчиков.
+
+    Без него такие ошибки видны только в консоли сервера, а пользователь просто
+    не получает ответа. Пишем в /errors и сообщаем пользователю, что случилось.
+    """
+    exc = context.error
+    logger.error("Необработанная ошибка при обработке апдейта", exc_info=exc)
+
+    # Не достучались до самого Telegram — сообщить пользователю всё равно не выйдет.
+    if isinstance(exc, TelegramNetworkError) or not isinstance(update, Update):
+        return
+    chat = update.effective_chat
+    if chat is None:
+        return
+    user = update.effective_user
+    _record_error(user.id if user else chat.id, exc, stage="обработка сообщения")
+
+    if update.callback_query is not None:
+        try:
+            await update.callback_query.answer()  # убираем «часики» на кнопке
+        except Exception:
+            pass
+
+    if _is_network_error(exc):
+        text = _unreachable_text("VK")
+    else:
+        text = "❌ Что-то пошло не так. Попробуй ещё раз."
+    try:
+        await context.bot.send_message(chat.id, text + "\n\nℹ️ Подробности — в /errors")
+    except Exception:
+        logger.debug("_on_error: не удалось уведомить пользователя", exc_info=True)
+
+
 # ─── Общий /cancel ────────────────────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2036,6 +2190,8 @@ def main() -> None:
     # Ссылка на сообщество VK вне диалогов — последним, чтобы не перехватывать
     # текст в активных диалогах (описание / заготовка могут содержать ссылку).
     app.add_handler(MessageHandler(_VK_COMMUNITY_FILTER & ~filters.COMMAND, handle_community_link))
+    # Любая непойманная ошибка — пользователю сообщение, а не тишина.
+    app.add_error_handler(_on_error)
 
     # Периодическая очистка старых логов ошибок.
     app.job_queue.run_repeating(
