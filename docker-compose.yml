@@ -2,10 +2,13 @@ services:
   bot:
     build: .
     restart: unless-stopped
-    environment:
-      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
-      - ADMIN_IDS=${ADMIN_IDS}
-      - ERROR_RETENTION_DAYS=${ERROR_RETENTION_DAYS:-5}
-      - ERROR_CLEANUP_INTERVAL_DAYS=${ERROR_CLEANUP_INTERVAL_DAYS:-5}
+    # env_file пробрасывает В КОНТЕЙНЕР все переменные из .env целиком.
+    # Раньше здесь был жёсткий список из 4 переменных (TELEGRAM_TOKEN,
+    # ADMIN_IDS, ERROR_RETENTION_DAYS, ERROR_CLEANUP_INTERVAL_DAYS) — все
+    # остальные настройки в .env (VK_PROXY, VK_PUBLISH_CONCURRENCY,
+    # DOWNLOAD_TIMEOUT, VK_CONNECT_TIMEOUT и т.д.) молча игнорировались:
+    # бот их не видел и всегда работал со значениями по умолчанию.
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data
