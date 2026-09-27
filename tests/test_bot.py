@@ -1556,3 +1556,50 @@ async def test_rename_rejects_empty_name(tmp_db):
     context.user_data = {"rename_group_id": tmp_db.get_groups(1)[0]["id"]}
     assert await bot.groups_rename(u, context) == bot.G_RENAME
     assert tmp_db.get_groups(1)[0]["name"] == "A"
+
+
+# ─── Таймауты подключения к VK и общий предел поиска ──────────────────────────
+
+import time as _time_mod
+
+
+def test_timeout_session_sets_default_timeout():
+    with patch("requests.Session.request", return_value="ok") as req:
+        bot._TimeoutSession().post("https://api.vk.com/method/x", data={})
+    assert req.call_args.kwargs["timeout"] == (bot.VK_CONNECT_TIMEOUT, 60)
+
+
+def test_timeout_session_keeps_explicit_timeout():
+    with patch("requests.Session.request", return_value="ok") as req:
+        bot._TimeoutSession().get("https://x", timeout=5)
+    assert req.call_args.kwargs["timeout"] == 5
+
+
+def test_short_video_uses_session_with_timeout(tmp_video):
+    with patch("vk_api.VkApi") as cls:
+        cls.return_value.get_api.return_value.shortVideo.create.side_effect = _api_err(15)
+        with pytest.raises(bot.VKError):
+            bot._upload_short_video("tok", 1, tmp_video, "")
+    assert isinstance(cls.call_args.kwargs["session"], bot._TimeoutSession)
+
+
+def test_vk_call_uses_short_connect_timeout():
+    with patch.object(bot.requests, "post", return_value=_mock_resp({"response": 1})) as post:
+        bot._vk_call("users.get", "tok")
+    assert post.call_args.kwargs["timeout"][0] == bot.VK_CONNECT_TIMEOUT
+
+
+async def test_lookup_group_answers_within_deadline(monkeypatch):
+    monkeypatch.setattr(bot, "VK_LOOKUP_DEADLINE", 0.2)
+    monkeypatch.setattr(bot.db, "get_vk_token", lambda uid: "tok")
+    monkeypatch.setattr(bot, "resolve_vk_group", lambda *a: _time_mod.sleep(1.5))
+    u = MagicMock()
+    u.effective_user.id = 1
+    u.message.text = "https://vk.ru/imfather"
+    u.message.entities = []
+    u.message.reply_text = AsyncMock()
+    started = _time_mod.monotonic()
+    group_id, _, error, _ = await bot._lookup_group(u, MagicMock())
+    assert _time_mod.monotonic() - started < 1.0
+    assert group_id is None and "не отвечает" in error
+    assert "Ищу" in u.message.reply_text.await_args_list[0].args[0]

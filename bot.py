@@ -294,6 +294,39 @@ _VK_FATAL_LOOKUP_CODES = {None, 1, 5, 6, 9, 10, 14, 17, 29}
 VK_LOOKUP_RETRIES = int(os.getenv("VK_LOOKUP_RETRIES", "3"))
 VK_LOOKUP_RETRY_DELAY = float(os.getenv("VK_LOOKUP_RETRY_DELAY", "1"))
 
+# Таймаут ПОДКЛЮЧЕНИЯ к серверам VK, секунд. Важно: у api.vk.com ~9 IP-адресов,
+# и requests/urllib3 при неудаче перебирает их по очереди, ожидая connect-таймаут
+# на КАЖДОМ. С прежними 15 с один запрос при недоступном VK висел ~2 минуты,
+# а с ретраями — до 7 минут, и пользователь не получал никакого ответа.
+VK_CONNECT_TIMEOUT = float(os.getenv("VK_CONNECT_TIMEOUT", "4"))
+# Общий предел ожидания поиска группы / проверки токена — после него
+# пользователь получает «сервер VK не отвечает», даже если запросы ещё идут.
+VK_LOOKUP_DEADLINE = float(os.getenv("VK_LOOKUP_DEADLINE", "40"))
+
+
+class _TimeoutSession(requests.Session):
+    """requests.Session с таймаутом по умолчанию.
+
+    vk_api делает запросы без таймаута вообще: при недоступном VK вызов мог
+    висеть десятки минут (системный таймаут TCP × 9 IP-адресов).
+    """
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", (VK_CONNECT_TIMEOUT, 60))
+        return super().request(*args, **kwargs)
+
+
+async def _run_vk_lookup(func, *args):
+    """Запускает синхронный поиск в VK в потоке с общим пределом времени.
+
+    Бросает asyncio.TimeoutError, если VK_LOOKUP_DEADLINE истёк (поток при
+    этом доработает сам — прервать его нельзя, но пользователь уже получит ответ).
+    """
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, func, *args), timeout=VK_LOOKUP_DEADLINE
+    )
+
 
 def _message_text(message) -> str:
     """Текст сообщения + адреса из скрытых ссылок (text_link).
@@ -369,7 +402,7 @@ def _vk_call(method: str, vk_token: str, **params) -> tuple[object, dict | None]
             resp = requests.post(
                 f"https://api.vk.com/method/{method}",
                 data={**params, "access_token": vk_token, "v": VK_API_VERSION},
-                timeout=15,
+                timeout=(VK_CONNECT_TIMEOUT, 15),
             ).json()
         except (requests.exceptions.RequestException, ValueError) as exc:
             err = {"error_code": None, "error_msg": f"сетевая ошибка: {exc}"}
@@ -379,10 +412,10 @@ def _vk_call(method: str, vk_token: str, **params) -> tuple[object, dict | None]
             err = resp["error"]
             if err.get("error_code") not in VK_RETRYABLE_ERROR_CODES:
                 break
-        logger.info("%s: попытка %s не удалась: %s", method, attempt + 1, err)
+        logger.warning("%s: попытка %s не удалась: %s", method, attempt + 1, err)
         if attempt + 1 < VK_LOOKUP_RETRIES:
             time.sleep(VK_LOOKUP_RETRY_DELAY * (2 ** attempt))
-    logger.info("%s error: %s", method, err)
+    logger.warning("%s error: %s", method, err)
     return None, err
 
 
@@ -541,7 +574,7 @@ def _delete_vk_video(vk_token: str, owner_id, video_id) -> None:
                 "owner_id": owner_id,
                 "video_id": video_id,
             },
-            timeout=30,
+            timeout=(VK_CONNECT_TIMEOUT, 30),
         )
     except Exception:
         logger.warning("Не удалось удалить черновик видео %s_%s", owner_id, video_id, exc_info=True)
@@ -569,7 +602,11 @@ def _upload_short_video(
     """
     _check_cancel(cancel_event)
     try:
-        vk = vk_api.VkApi(token=vk_token, api_version=VK_SHORT_VIDEO_API_VERSION).get_api()
+        vk = vk_api.VkApi(
+            token=vk_token,
+            api_version=VK_SHORT_VIDEO_API_VERSION,
+            session=_TimeoutSession(),
+        ).get_api()
     except Exception as exc:
         raise VKError(None, f"ошибка инициализации vk_api: {exc}", stage="vk_api init", network=True) from exc
 
@@ -600,7 +637,7 @@ def _upload_short_video(
         stage = "загрузка файла shortVideo"
         try:
             with open(file_path, "rb") as f:
-                upload_resp = requests.post(upload_url, files={"file": f}, timeout=300)
+                upload_resp = requests.post(upload_url, files={"file": f}, timeout=(VK_CONNECT_TIMEOUT, 300))
                 upload_resp.raise_for_status()
                 logger.info("shortVideo upload response: %s", upload_resp.text[:500])
                 upload_info = upload_resp.json()
@@ -704,7 +741,7 @@ def _upload_video_legacy(
         save_resp = requests.post(
             "https://api.vk.com/method/video.save",
             data=save_data,
-            timeout=30,
+            timeout=(VK_CONNECT_TIMEOUT, 30),
         ).json()
     except requests.exceptions.RequestException as exc:
         raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
@@ -732,7 +769,7 @@ def _upload_video_legacy(
         stage = "загрузка файла в VK"
         try:
             with open(file_path, "rb") as f:
-                upload_resp = requests.post(upload_url, files={"video_file": f}, timeout=300)
+                upload_resp = requests.post(upload_url, files={"video_file": f}, timeout=(VK_CONNECT_TIMEOUT, 300))
                 upload_resp.raise_for_status()
                 logger.info("video upload response: %s", upload_resp.text[:500])
         except requests.exceptions.RequestException as exc:
@@ -751,7 +788,7 @@ def _upload_video_legacy(
         }
         try:
             wall_resp = requests.post(
-                "https://api.vk.com/method/wall.post", data=wall_params, timeout=30
+                "https://api.vk.com/method/wall.post", data=wall_params, timeout=(VK_CONNECT_TIMEOUT, 30)
             ).json()
         except requests.exceptions.RequestException as exc:
             # Пост мог уже появиться — не удаляем видео и не повторяем.
@@ -1770,8 +1807,10 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # Проверяем токен сразу, а не при первой публикации (которая может быть
     # отложенной на завтра — и тогда пользователь узнает о проблеме слишком поздно).
     await update.message.reply_text("⏳ Проверяю токен в VK…")
-    loop = asyncio.get_running_loop()
-    response, err = await loop.run_in_executor(None, lambda: _vk_call("users.get", token))
+    try:
+        response, err = await _run_vk_lookup(_vk_call, "users.get", token)
+    except asyncio.TimeoutError:
+        response, err = None, {"error_code": None, "error_msg": "VK не ответил вовремя"}
 
     if err and err.get("error_code") in (5, 1116):
         await update.message.reply_text(
@@ -1874,10 +1913,17 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def _lookup_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Определяет сообщество по тексту сообщения. Возвращает (group_id, name, error, note)."""
     vk_token = db.get_vk_token(update.effective_user.id)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, resolve_vk_group, vk_token, _message_text(update.message)
-    )
+    # Сразу даём знать, что ссылка принята: если VK отвечает медленно, раньше
+    # пользователь минутами не видел никакой реакции и считал, что бот сломан.
+    try:
+        await update.message.reply_text("🔎 Ищу сообщество в VK…")
+    except Exception:
+        logger.warning("Не удалось отправить «Ищу сообщество»", exc_info=True)
+    try:
+        return await _run_vk_lookup(resolve_vk_group, vk_token, _message_text(update.message))
+    except asyncio.TimeoutError:
+        logger.warning("Поиск сообщества не уложился в %s с — VK не отвечает", VK_LOOKUP_DEADLINE)
+        return None, None, _unreachable_text("VK"), None
 
 
 def _no_name_text(group_id: int, note: str | None, prompt: str = "Введи название вручную:") -> str:
