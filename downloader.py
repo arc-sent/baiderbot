@@ -335,17 +335,36 @@ def _download_ytdlp_sync(
     save_path: str | None,
     prefix: str,
     default_title: str,
+    proxy: str | None = None,
 ) -> tuple[str, str]:
     label = {"tiktok": "TikTok", "youtube": "YouTube", "instagram": "Instagram"}.get(prefix, prefix)
-    return _ytdlp_download(url, save_path, prefix, default_title, label)
+    return _ytdlp_download(url, save_path, prefix, default_title, label, proxy=proxy)
+
+
+# Прокси, которым скачивание TikTok пробует ещё раз, если первая (прямая)
+# попытка упала с ошибкой — TikTok иногда блокирует IP дата-центров, и другой
+# выходной адрес может помочь. Используется ТОЛЬКО как запасной вариант: пока
+# прямое скачивание работает, прокси не задействуется вообще.
+TT_PROXY = os.getenv("TT_PROXY", "").strip() or None
 
 
 async def download_tiktok(url: str, save_path: str | None = None) -> tuple[str, str]:
-    """Возвращает (путь к файлу, название)."""
+    """Возвращает (путь к файлу, название).
+
+    Сначала пробует скачать напрямую. Если попытка упала с ошибкой и задан
+    TT_PROXY — один раз повторяет через него, прежде чем сдаться."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _download_executor, _download_ytdlp_sync, url, save_path, "tiktok", "TikTok Video"
-    )
+    try:
+        return await loop.run_in_executor(
+            _download_executor, _download_ytdlp_sync, url, save_path, "tiktok", "TikTok Video"
+        )
+    except Exception:
+        if not TT_PROXY:
+            raise
+        logger.info("TikTok: прямое скачивание не удалось, повторяю через TT_PROXY")
+        return await loop.run_in_executor(
+            _download_executor, _download_ytdlp_sync, url, save_path, "tiktok", "TikTok Video", TT_PROXY
+        )
 
 
 async def download_youtube(url: str, save_path: str | None = None) -> tuple[str, str]:

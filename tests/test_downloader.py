@@ -1,5 +1,6 @@
 """Тесты downloader.py — чистые функции без сетевых запросов."""
 
+import asyncio
 import pytest
 from downloader import (
     detect_platform,
@@ -298,3 +299,75 @@ def test_cleanup_tmp_files(tmp_path, monkeypatch):
 def test_cleanup_tmp_files_missing_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(_dl, "_TMP_ROOT", str(tmp_path / "nope"))
     assert _dl.cleanup_tmp_files(1) == 0
+
+
+# ─── TT_PROXY: запасной прокси для TikTok — только при ошибке ─────────────────
+
+def test_download_tiktok_no_retry_when_direct_succeeds(monkeypatch):
+    monkeypatch.setattr(_dl, "TT_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    calls = []
+
+    def fake_sync(url, save_path, prefix, default_title, proxy=None):
+        calls.append(proxy)
+        return "/tmp/x.mp4", "T"
+
+    monkeypatch.setattr(_dl, "_download_ytdlp_sync", fake_sync)
+    result = asyncio.run(_dl.download_tiktok("https://tiktok.com/@u/video/1"))
+    assert result == ("/tmp/x.mp4", "T")
+    assert calls == [None]  # ни разу не понадобился прокси
+
+
+def test_download_tiktok_no_retry_without_tt_proxy(monkeypatch):
+    monkeypatch.setattr(_dl, "TT_PROXY", None)
+    calls = []
+
+    def fake_sync(url, save_path, prefix, default_title, proxy=None):
+        calls.append(proxy)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_dl, "_download_ytdlp_sync", fake_sync)
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(_dl.download_tiktok("https://tiktok.com/@u/video/1"))
+    assert calls == [None]  # без TT_PROXY повтора нет
+
+
+def test_download_tiktok_retries_via_proxy_on_error(monkeypatch):
+    monkeypatch.setattr(_dl, "TT_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    calls = []
+
+    def fake_sync(url, save_path, prefix, default_title, proxy=None):
+        calls.append(proxy)
+        if proxy is None:
+            raise RuntimeError("прямое скачивание упало")
+        return "/tmp/via_proxy.mp4", "T"
+
+    monkeypatch.setattr(_dl, "_download_ytdlp_sync", fake_sync)
+    result = asyncio.run(_dl.download_tiktok("https://tiktok.com/@u/video/1"))
+    assert result == ("/tmp/via_proxy.mp4", "T")
+    assert calls == [None, "socks5h://u:p@1.2.3.4:1080"]
+
+
+def test_download_tiktok_raises_if_proxy_retry_also_fails(monkeypatch):
+    monkeypatch.setattr(_dl, "TT_PROXY", "socks5h://u:p@1.2.3.4:1080")
+
+    def fake_sync(url, save_path, prefix, default_title, proxy=None):
+        raise RuntimeError(f"упало (proxy={proxy})")
+
+    monkeypatch.setattr(_dl, "_download_ytdlp_sync", fake_sync)
+    with pytest.raises(RuntimeError, match=r"proxy=socks5h"):
+        asyncio.run(_dl.download_tiktok("https://tiktok.com/@u/video/1"))
+
+
+def test_other_platforms_never_use_tt_proxy(monkeypatch):
+    """youtube/instagram не должны знать о TT_PROXY вообще."""
+    monkeypatch.setattr(_dl, "TT_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    calls = []
+
+    def fake_sync(url, save_path, prefix, default_title, proxy=None):
+        calls.append((prefix, proxy))
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_dl, "_download_ytdlp_sync", fake_sync)
+    with pytest.raises(RuntimeError):
+        asyncio.run(_dl.download_youtube("https://youtube.com/shorts/1"))
+    assert calls == [("youtube", None)]  # один вызов, без повтора и без прокси
