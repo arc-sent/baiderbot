@@ -1694,10 +1694,11 @@ async def test_proxy_check_reports_all_three_when_configured(monkeypatch, tmp_db
     monkeypatch.setattr(_vk_proxy, "check_vk_direct", lambda: (False, "timeout"))
     monkeypatch.setattr(_vk_proxy, "check_proxy_server", lambda: (True, "12 мс"))
     monkeypatch.setattr(_vk_proxy, "check_vk_via_proxy", lambda: (True, "80 мс"))
+    monkeypatch.setattr(bot, "_check_telegram_direct", lambda: (True, "50 мс"))
     u = _cb_update(1, "px_check")
     await bot.proxy_callback(u, MagicMock())
     text = u.callback_query.edit_message_text.await_args.args[0]
-    assert "❌" in text and text.count("✅") == 2
+    assert "❌" in text and text.count("✅") == 3
     assert "напрямую" in text and "прокси" in text
 
 
@@ -1705,6 +1706,7 @@ async def test_proxy_check_skips_via_proxy_when_not_configured(monkeypatch):
     monkeypatch.setattr(bot, "ADMIN_IDS", {1})
     monkeypatch.delenv("VK_PROXY", raising=False)
     monkeypatch.setattr(_vk_proxy, "check_vk_direct", lambda: (True, "10 мс"))
+    monkeypatch.setattr(bot, "_check_telegram_direct", lambda: (True, "10 мс"))
     u = _cb_update(1, "px_check")
     await bot.proxy_callback(u, MagicMock())
     text = u.callback_query.edit_message_text.await_args.args[0]
@@ -1836,3 +1838,72 @@ def test_likee_never_uses_vk_proxy(monkeypatch, tmp_db):
         dl._get_likee_info_sync("https://likee.video/v/x")
     session = ms.return_value
     assert session.get.call_args.kwargs["proxies"] is None
+
+
+# ─── TG_PROXY: прокси для соединения с Telegram ────────────────────────────────
+
+from telegram.ext import Application, ApplicationBuilder
+
+
+def test_telegram_proxy_status_not_configured(monkeypatch):
+    monkeypatch.setattr(bot, "TG_PROXY", None)
+    assert "не настроен" in bot._telegram_proxy_status_text()
+
+
+def test_telegram_proxy_status_configured(monkeypatch):
+    monkeypatch.setattr(bot, "TG_PROXY", "socks5h://u:p@1.2.3.4:1081")
+    text = bot._telegram_proxy_status_text()
+    assert "настроен" in text and "перезапуск" in text
+
+
+def test_proxy_status_text_includes_telegram_section(monkeypatch, tmp_db):
+    monkeypatch.setattr(bot, "TG_PROXY", "socks5h://u:p@1.2.3.4:1081")
+    monkeypatch.delenv("VK_PROXY", raising=False)
+    assert "Прокси Telegram" in bot._proxy_status_text()
+
+
+def test_check_telegram_direct_ok():
+    with patch.object(bot.requests, "get", return_value=MagicMock()):
+        ok, info = bot._check_telegram_direct()
+    assert ok is True and "мс" in info
+
+
+def test_check_telegram_direct_failure():
+    with patch.object(bot.requests, "get", side_effect=_requests.exceptions.ConnectTimeout("x")):
+        ok, info = bot._check_telegram_direct()
+    assert ok is False
+
+
+def test_main_wires_tg_proxy_into_builder(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "TG_PROXY", "socks5h://u:p@1.2.3.4:1081")
+    monkeypatch.setattr(bot.db, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(bot.db, "DB_PATH", str(tmp_path / "t.db"))
+    calls = []
+    orig_proxy = ApplicationBuilder.proxy
+    orig_gup = ApplicationBuilder.get_updates_proxy
+
+    def spy_proxy(self, url):
+        calls.append(("proxy", url))
+        return orig_proxy(self, url)
+
+    def spy_gup(self, url):
+        calls.append(("get_updates_proxy", url))
+        return orig_gup(self, url)
+
+    monkeypatch.setattr(ApplicationBuilder, "proxy", spy_proxy)
+    monkeypatch.setattr(ApplicationBuilder, "get_updates_proxy", spy_gup)
+    with patch.object(Application, "run_polling", lambda self, *a, **k: None):
+        bot.main()
+    assert ("proxy", "socks5h://u:p@1.2.3.4:1081") in calls
+    assert ("get_updates_proxy", "socks5h://u:p@1.2.3.4:1081") in calls
+
+
+def test_main_skips_proxy_when_tg_proxy_unset(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "TG_PROXY", None)
+    monkeypatch.setattr(bot.db, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(bot.db, "DB_PATH", str(tmp_path / "t.db"))
+    called = []
+    monkeypatch.setattr(ApplicationBuilder, "proxy", lambda self, url: called.append(url) or self)
+    with patch.object(Application, "run_polling", lambda self, *a, **k: None):
+        bot.main()
+    assert called == []

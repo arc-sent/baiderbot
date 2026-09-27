@@ -34,6 +34,11 @@ from downloader import (
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Прокси для соединения С TELEGRAM (не с VK!) — на случай, если сам сервер
+# бота не может достучаться до api.telegram.org напрямую. Требует httpx[socks]
+# (пакет socksio) — см. requirements.txt. Статичный на время работы процесса,
+# в отличие от VK_PROXY не переключается из админ-панели без перезапуска.
+TG_PROXY = os.getenv("TG_PROXY", "").strip() or None
 VK_API_VERSION = "5.199"
 VK_SHORT_VIDEO_API_VERSION = "5.126"  # shortVideo методы работают только на этой версии
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
@@ -2416,15 +2421,25 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Прокси VK: статус и переключатель (/proxy, только для админов) ───────────
 
+def _telegram_proxy_status_text() -> str:
+    if not TG_PROXY:
+        return "\n\n✈️ Прокси Telegram: не настроен (TG_PROXY не задан) — соединение напрямую."
+    return (
+        "\n\n✈️ Прокси Telegram: настроен, используется с момента старта бота.\n"
+        "Меняется только через .env (TG_PROXY) + перезапуск — здесь не переключается."
+    )
+
+
 def _proxy_status_text() -> str:
     if not vk_proxy.is_configured():
-        return (
+        text = (
             "🌐 Прокси VK\n\n"
             "Не настроен — адрес не задан в .env (переменная VK_PROXY).\n"
             "Все запросы к VK идут напрямую с этого сервера."
         )
+        return text + _telegram_proxy_status_text()
     state = "🟢 включён" if vk_proxy.is_enabled() else "🔴 выключен"
-    return (
+    text = (
         f"🌐 Прокси VK\n\n"
         f"Настроен: да\n"
         f"Сейчас: {state}\n\n"
@@ -2433,6 +2448,7 @@ def _proxy_status_text() -> str:
         "Прокси используется ТОЛЬКО для запросов к VK — TikTok, YouTube, "
         "Instagram и Likee всегда работают напрямую."
     )
+    return text + _telegram_proxy_status_text()
 
 
 def _proxy_keyboard() -> InlineKeyboardMarkup:
@@ -2443,8 +2459,17 @@ def _proxy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _check_telegram_direct() -> tuple[bool, str]:
+    t0 = time.monotonic()
+    try:
+        requests.get("https://api.telegram.org/", timeout=(4, 8))
+    except Exception as exc:
+        return False, str(exc).splitlines()[0][:200]
+    return True, f"{(time.monotonic() - t0) * 1000:.0f} мс"
+
+
 def _run_proxy_checks() -> str:
-    """Выполняет все три проверки синхронно (вызывается в executor'е)."""
+    """Выполняет все проверки синхронно (вызывается в executor'е)."""
     direct_ok, direct_info = vk_proxy.check_vk_direct()
     lines = [
         "🌐 Проверка соединения\n",
@@ -2456,7 +2481,17 @@ def _run_proxy_checks() -> str:
         via_ok, via_info = vk_proxy.check_vk_via_proxy()
         lines.append(f"{'✅' if via_ok else '❌'} VK через прокси: {via_info}")
     else:
-        lines.append("➖ Прокси не настроен (VK_PROXY не задан) — остальные проверки пропущены.")
+        lines.append("➖ Прокси VK не настроен (VK_PROXY не задан) — остальные проверки пропущены.")
+
+    tg_ok, tg_info = _check_telegram_direct()
+    lines.append("")
+    lines.append(f"{'✅' if tg_ok else '❌'} Telegram напрямую: {tg_info}")
+    lines.append(
+        "ℹ️ Соединение бота с Telegram настраивается один раз при старте — "
+        "текущий статус смотри по тому, отвечает ли сам бот."
+        if TG_PROXY else
+        "➖ Прокси Telegram не настроен (TG_PROXY не задан)."
+    )
     return "\n".join(lines)
 
 
@@ -2633,7 +2668,7 @@ def main() -> None:
     # операция в одном потоке не «замораживает» ответы остальным сообщениям.
     # Увеличенные таймауты и пул соединений — чтобы случайные обрывы/медленная
     # сеть до api.telegram.org не валили обработку с TimedOut.
-    app = (
+    builder = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .persistence(persistence)
@@ -2647,8 +2682,16 @@ def main() -> None:
         .pool_timeout(30.0)
         .get_updates_connect_timeout(30.0)
         .get_updates_read_timeout(30.0)
-        .build()
     )
+    # TG_PROXY — для случая, когда сам сервер бота не может достучаться до
+    # Telegram напрямую (бывает при размещении в РФ), но есть прокси/сервер
+    # с рабочим доступом к Telegram. В отличие от VK_PROXY, это НЕ переключатель
+    # в рантайме: соединение с Telegram настраивается один раз при старте,
+    # поменять его можно только перезапуском бота с новым значением в .env.
+    if TG_PROXY:
+        builder = builder.proxy(TG_PROXY).get_updates_proxy(TG_PROXY)
+        logger.info("Подключение к Telegram настроено через прокси")
+    app = builder.build()
 
     upload_conv = ConversationHandler(
         # entry_point принимает только распознанные URL платформ — иначе любой текст
