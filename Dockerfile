@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py db.py downloader.py ./
+COPY bot.py db.py downloader.py vk_proxy.py ./
 
 ENV DATA_DIR=/app/data
 VOLUME ["/app/data"]

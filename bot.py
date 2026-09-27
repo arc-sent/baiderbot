@@ -25,6 +25,7 @@ from telegram.ext import (
 from dotenv import load_dotenv
 
 import db
+import vk_proxy
 from downloader import (
     detect_platform, download_tiktok, download_likee, download_youtube,
     download_vk, download_instagram, cleanup_tmp_files,
@@ -305,14 +306,17 @@ VK_LOOKUP_DEADLINE = float(os.getenv("VK_LOOKUP_DEADLINE", "40"))
 
 
 class _TimeoutSession(requests.Session):
-    """requests.Session с таймаутом по умолчанию.
+    """requests.Session с таймаутом по умолчанию и (если включён) прокси VK.
 
     vk_api делает запросы без таймаута вообще: при недоступном VK вызов мог
-    висеть десятки минут (системный таймаут TCP × 9 IP-адресов).
+    висеть десятки минут (системный таймаут TCP × 9 IP-адресов). Прокси
+    проверяется на каждый запрос заново — переключатель в админ-панели
+    должен подхватываться сразу, без пересоздания сессии.
     """
 
     def request(self, *args, **kwargs):
         kwargs.setdefault("timeout", (VK_CONNECT_TIMEOUT, 60))
+        kwargs.setdefault("proxies", vk_proxy.requests_proxies())
         return super().request(*args, **kwargs)
 
 
@@ -402,6 +406,7 @@ def _vk_call(method: str, vk_token: str, **params) -> tuple[object, dict | None]
             resp = requests.post(
                 f"https://api.vk.com/method/{method}",
                 data={**params, "access_token": vk_token, "v": VK_API_VERSION},
+                proxies=vk_proxy.requests_proxies(),
                 timeout=(VK_CONNECT_TIMEOUT, 15),
             ).json()
         except (requests.exceptions.RequestException, ValueError) as exc:
@@ -574,6 +579,7 @@ def _delete_vk_video(vk_token: str, owner_id, video_id) -> None:
                 "owner_id": owner_id,
                 "video_id": video_id,
             },
+            proxies=vk_proxy.requests_proxies(),
             timeout=(VK_CONNECT_TIMEOUT, 30),
         )
     except Exception:
@@ -637,7 +643,10 @@ def _upload_short_video(
         stage = "загрузка файла shortVideo"
         try:
             with open(file_path, "rb") as f:
-                upload_resp = requests.post(upload_url, files={"file": f}, timeout=(VK_CONNECT_TIMEOUT, 300))
+                upload_resp = requests.post(
+                    upload_url, files={"file": f},
+                    proxies=vk_proxy.requests_proxies(), timeout=(VK_CONNECT_TIMEOUT, 300),
+                )
                 upload_resp.raise_for_status()
                 logger.info("shortVideo upload response: %s", upload_resp.text[:500])
                 upload_info = upload_resp.json()
@@ -741,6 +750,7 @@ def _upload_video_legacy(
         save_resp = requests.post(
             "https://api.vk.com/method/video.save",
             data=save_data,
+            proxies=vk_proxy.requests_proxies(),
             timeout=(VK_CONNECT_TIMEOUT, 30),
         ).json()
     except requests.exceptions.RequestException as exc:
@@ -769,7 +779,10 @@ def _upload_video_legacy(
         stage = "загрузка файла в VK"
         try:
             with open(file_path, "rb") as f:
-                upload_resp = requests.post(upload_url, files={"video_file": f}, timeout=(VK_CONNECT_TIMEOUT, 300))
+                upload_resp = requests.post(
+                    upload_url, files={"video_file": f},
+                    proxies=vk_proxy.requests_proxies(), timeout=(VK_CONNECT_TIMEOUT, 300),
+                )
                 upload_resp.raise_for_status()
                 logger.info("video upload response: %s", upload_resp.text[:500])
         except requests.exceptions.RequestException as exc:
@@ -788,7 +801,8 @@ def _upload_video_legacy(
         }
         try:
             wall_resp = requests.post(
-                "https://api.vk.com/method/wall.post", data=wall_params, timeout=(VK_CONNECT_TIMEOUT, 30)
+                "https://api.vk.com/method/wall.post", data=wall_params,
+                proxies=vk_proxy.requests_proxies(), timeout=(VK_CONNECT_TIMEOUT, 30),
             ).json()
         except requests.exceptions.RequestException as exc:
             # Пост мог уже появиться — не удаляем видео и не повторяем.
@@ -2400,6 +2414,92 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Очистка логов ошибок: удалено %s записей", deleted)
 
 
+# ─── Прокси VK: статус и переключатель (/proxy, только для админов) ───────────
+
+def _proxy_status_text() -> str:
+    if not vk_proxy.is_configured():
+        return (
+            "🌐 Прокси VK\n\n"
+            "Не настроен — адрес не задан в .env (переменная VK_PROXY).\n"
+            "Все запросы к VK идут напрямую с этого сервера."
+        )
+    state = "🟢 включён" if vk_proxy.is_enabled() else "🔴 выключен"
+    return (
+        f"🌐 Прокси VK\n\n"
+        f"Настроен: да\n"
+        f"Сейчас: {state}\n\n"
+        "Нажми «Проверить соединение», чтобы узнать, отвечает ли VK "
+        "напрямую, доступен ли сам сервер прокси и проходит ли через него VK.\n\n"
+        "Прокси используется ТОЛЬКО для запросов к VK — TikTok, YouTube, "
+        "Instagram и Likee всегда работают напрямую."
+    )
+
+
+def _proxy_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🔄 Проверить соединение", callback_data="px_check")]]
+    if vk_proxy.is_configured():
+        label = "🔴 Выключить прокси" if vk_proxy.is_enabled() else "🟢 Включить прокси"
+        rows.append([InlineKeyboardButton(label, callback_data="px_toggle")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _run_proxy_checks() -> str:
+    """Выполняет все три проверки синхронно (вызывается в executor'е)."""
+    direct_ok, direct_info = vk_proxy.check_vk_direct()
+    lines = [
+        "🌐 Проверка соединения\n",
+        f"{'✅' if direct_ok else '❌'} VK напрямую (без прокси): {direct_info}",
+    ]
+    if vk_proxy.is_configured():
+        server_ok, server_info = vk_proxy.check_proxy_server()
+        lines.append(f"{'✅' if server_ok else '❌'} Сервер прокси доступен: {server_info}")
+        via_ok, via_info = vk_proxy.check_vk_via_proxy()
+        lines.append(f"{'✅' if via_ok else '❌'} VK через прокси: {via_info}")
+    else:
+        lines.append("➖ Прокси не настроен (VK_PROXY не задан) — остальные проверки пропущены.")
+    return "\n".join(lines)
+
+
+async def cmd_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("Недостаточно прав.")
+        return
+    await update.message.reply_text(_proxy_status_text(), reply_markup=_proxy_keyboard())
+
+
+async def proxy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_admin(update.effective_user.id):
+        await _safe_answer(query, "Недостаточно прав", show_alert=True)
+        return
+
+    if query.data == "px_toggle":
+        if not vk_proxy.is_configured():
+            await _safe_answer(query, "Прокси не настроен в .env", show_alert=True)
+            return
+        vk_proxy.set_enabled(not vk_proxy.is_enabled())
+        await _safe_answer(query, "Прокси включён" if vk_proxy.is_enabled() else "Прокси выключен")
+        await query.edit_message_text(_proxy_status_text(), reply_markup=_proxy_keyboard())
+        return
+
+    if query.data == "px_check":
+        await _safe_answer(query, "Проверяю…")
+        loop = asyncio.get_running_loop()
+        try:
+            report = await asyncio.wait_for(
+                loop.run_in_executor(None, _run_proxy_checks), timeout=25,
+            )
+        except asyncio.TimeoutError:
+            report = "⏱ Проверка не уложилась в отведённое время — VK или прокси не отвечают вовсе."
+        try:
+            await query.edit_message_text(report, reply_markup=_proxy_keyboard())
+        except BadRequest:
+            pass  # "not modified" — прошлая проверка дала тот же результат
+        return
+
+    await _safe_answer(query)
+
+
 # ─── Глобальный обработчик ошибок ─────────────────────────────────────────────
 
 _HARMLESS_BAD_REQUEST_MARKERS = (
@@ -2684,6 +2784,9 @@ def main() -> None:
     app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("admin", cmd_errors))
     app.add_handler(CallbackQueryHandler(errors_callback, pattern=r"^err_"))
+    # Статус и переключатель прокси VK (только для админов).
+    app.add_handler(CommandHandler("proxy", cmd_proxy))
+    app.add_handler(CallbackQueryHandler(proxy_callback, pattern=r"^px_"))
     # Кнопки меню — до диалогов, чтобы перехватывать нажатия даже внутри разговора
     app.add_handler(MessageHandler(filters.Text(MENU_BUTTON_TEXTS), main_menu_button))
     app.add_handler(CallbackQueryHandler(handle_token_delete, pattern=r"^settoken_delete$"))

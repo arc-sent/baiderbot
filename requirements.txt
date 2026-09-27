@@ -5,3 +5,4 @@ python-dotenv>=1.0.0
 pytz>=2024.1
 urllib3>=2.0.0
 vk_api>=11.9.0
+PySocks>=1.7.1

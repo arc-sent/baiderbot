@@ -19,6 +19,8 @@ from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
 
+import vk_proxy
+
 urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
 
@@ -250,8 +252,12 @@ def _ytdlp_download(
     prefix: str,
     default_title: str,
     label: str,
+    proxy: str | None = None,
 ) -> tuple[str, str]:
     """Скачивает ролик через yt-dlp. Возвращает (путь к файлу, название).
+
+    proxy — адрес прокси (например socks5h://user:pass@host:port), только для
+    VK; для остальных платформ вызывающий код его не передаёт.
 
     Временная папка удаляется всегда — и при успехе (итоговый файл переносится
     из неё), и при ошибке: раньше .part-файлы, кэш и исходники после
@@ -262,9 +268,12 @@ def _ytdlp_download(
     try:
         try:
             # Фаза 1: метаданные без скачивания — проверяем длительность
-            with yt_dlp.YoutubeDL({
+            meta_opts = {
                 "quiet": True, "no_warnings": True, "socket_timeout": YTDLP_SOCKET_TIMEOUT,
-            }) as ydl:
+            }
+            if proxy:
+                meta_opts["proxy"] = proxy
+            with yt_dlp.YoutubeDL(meta_opts) as ydl:
                 meta = ydl.extract_info(url, download=False)
             _check_duration(meta.get("duration"))
 
@@ -285,6 +294,8 @@ def _ytdlp_download(
                 # загрузок не будут конкурировать за один и тот же кэш-файл.
                 "cachedir": os.path.join(tmpdir, ".cache"),
             }
+            if proxy:
+                ydl_opts["proxy"] = proxy
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 expected = ydl.prepare_filename(info)
@@ -537,7 +548,7 @@ def _try_embed(session: Session, oid: str, vid: str) -> tuple[str, int, int | No
         resp = session.get(
             f"https://vk.com/video_ext.php?oid={oid}&id={vid}&hd=1",
             headers={"User-Agent": _DESKTOP_UA, "Accept-Language": "ru-RU,ru;q=0.9"},
-            verify=False, timeout=12,
+            proxies=vk_proxy.requests_proxies(), verify=False, timeout=12,
         )
         result = _find_mp4(resp.text)
         if result:
@@ -548,8 +559,12 @@ def _try_embed(session: Session, oid: str, vid: str) -> tuple[str, int, int | No
 
 
 def _try_ajax(session: Session, oid: str, vid: str) -> tuple[str, int, int | None] | None:
+    proxies = vk_proxy.requests_proxies()
     try:
-        session.get("https://vk.com/", headers={"User-Agent": _DESKTOP_UA}, verify=False, timeout=8)
+        session.get(
+            "https://vk.com/", headers={"User-Agent": _DESKTOP_UA},
+            proxies=proxies, verify=False, timeout=8,
+        )
     except Exception:
         pass
     try:
@@ -564,7 +579,7 @@ def _try_ajax(session: Session, oid: str, vid: str) -> tuple[str, int, int | Non
                 "Referer": f"https://vk.com/video{oid}_{vid}",
                 "Accept-Language": "ru-RU,ru;q=0.9",
             },
-            verify=False, timeout=12,
+            proxies=proxies, verify=False, timeout=12,
         )
         result = _find_mp4(resp.text)
         if result:
@@ -579,7 +594,7 @@ def _try_vk_api(oid: str, vid: str, token: str) -> tuple[str, int, int | None] |
         data = _make_session().get(
             "https://api.vk.com/method/video.get",
             params={"videos": f"{oid}_{vid}", "access_token": token, "v": "5.199"},
-            timeout=15,
+            proxies=vk_proxy.requests_proxies(), timeout=15,
         ).json()
         items = data.get("response", {}).get("items", [])
         if not items:
@@ -600,7 +615,7 @@ def _try_mobile(session: Session, url: str) -> tuple[tuple[str, int, int | None]
         resp = session.get(
             mobile_url,
             headers={"User-Agent": _MOBILE_UA, "Accept-Language": "ru-RU,ru;q=0.9"},
-            allow_redirects=True, verify=False, timeout=12,
+            proxies=vk_proxy.requests_proxies(), allow_redirects=True, verify=False, timeout=12,
         )
         result = _find_mp4(resp.text)
         if result:
@@ -667,7 +682,7 @@ def _download_vk_ytdlp_sync(url: str) -> tuple[str, str]:
     Запасной метод: работает с клипами (HLS), нестандартными видео и любыми
     форматами, которые не поддерживают прямые методы (embed/ajax/api/mobile).
     """
-    return _ytdlp_download(url, None, "vk", "VK видео", "VK")
+    return _ytdlp_download(url, None, "vk", "VK видео", "VK", proxy=vk_proxy.active_url())
 
 
 def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
@@ -694,7 +709,7 @@ def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
             with _make_session().get(
                 info["video_url"],
                 headers=headers,
-                stream=True, timeout=180,
+                proxies=vk_proxy.requests_proxies(), stream=True, timeout=180,
             ) as r:
                 r.raise_for_status()
                 _save_stream(r, out_path, "VK")

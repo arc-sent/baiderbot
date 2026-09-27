@@ -1603,3 +1603,236 @@ async def test_lookup_group_answers_within_deadline(monkeypatch):
     assert _time_mod.monotonic() - started < 1.0
     assert group_id is None and "не отвечает" in error
     assert "Ищу" in u.message.reply_text.await_args_list[0].args[0]
+
+
+# ─── /proxy: статус, переключатель, проверка — только для админов ─────────────
+
+import vk_proxy as _vk_proxy
+
+
+def _msg_update(uid):
+    u = MagicMock()
+    u.effective_user.id = uid
+    u.message.reply_text = AsyncMock()
+    return u
+
+
+def _cb_update(uid, data):
+    u = MagicMock()
+    u.effective_user.id = uid
+    u.callback_query.data = data
+    u.callback_query.answer = AsyncMock()
+    u.callback_query.edit_message_text = AsyncMock()
+    return u
+
+
+async def test_cmd_proxy_rejects_non_admin(monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    u = _msg_update(2)
+    await bot.cmd_proxy(u, MagicMock())
+    assert "прав" in u.message.reply_text.await_args.args[0].lower()
+
+
+async def test_cmd_proxy_shows_not_configured(monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    monkeypatch.delenv("VK_PROXY", raising=False)
+    u = _msg_update(1)
+    await bot.cmd_proxy(u, MagicMock())
+    text = u.message.reply_text.await_args.args[0]
+    assert "Не настроен" in text
+    markup = u.message.reply_text.await_args.kwargs["reply_markup"]
+    # без настроенного прокси кнопки включения быть не должно
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert not any("Включить" in l or "Выключить" in l for l in labels)
+
+
+async def test_cmd_proxy_shows_enabled_state(monkeypatch, tmp_db):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    u = _msg_update(1)
+    await bot.cmd_proxy(u, MagicMock())
+    text = u.message.reply_text.await_args.args[0]
+    assert "включён" in text
+    markup = u.message.reply_text.await_args.kwargs["reply_markup"]
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert any("Выключить" in l for l in labels)
+
+
+async def test_proxy_callback_rejects_non_admin(monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    u = _cb_update(2, "px_toggle")
+    await bot.proxy_callback(u, MagicMock())
+    u.callback_query.answer.assert_awaited_once()
+    assert "прав" in u.callback_query.answer.await_args.args[0].lower()
+
+
+async def test_proxy_toggle_flips_state(monkeypatch, tmp_db):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    assert _vk_proxy.is_enabled() is True
+    u = _cb_update(1, "px_toggle")
+    await bot.proxy_callback(u, MagicMock())
+    assert _vk_proxy.is_enabled() is False
+    assert "выключен" in u.callback_query.answer.await_args.args[0].lower()
+
+    u2 = _cb_update(1, "px_toggle")
+    await bot.proxy_callback(u2, MagicMock())
+    assert _vk_proxy.is_enabled() is True
+
+
+async def test_proxy_toggle_without_config_shows_alert(monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    monkeypatch.delenv("VK_PROXY", raising=False)
+    u = _cb_update(1, "px_toggle")
+    await bot.proxy_callback(u, MagicMock())
+    assert u.callback_query.answer.await_args.kwargs.get("show_alert") is True
+
+
+async def test_proxy_check_reports_all_three_when_configured(monkeypatch, tmp_db):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    monkeypatch.setattr(_vk_proxy, "check_vk_direct", lambda: (False, "timeout"))
+    monkeypatch.setattr(_vk_proxy, "check_proxy_server", lambda: (True, "12 мс"))
+    monkeypatch.setattr(_vk_proxy, "check_vk_via_proxy", lambda: (True, "80 мс"))
+    u = _cb_update(1, "px_check")
+    await bot.proxy_callback(u, MagicMock())
+    text = u.callback_query.edit_message_text.await_args.args[0]
+    assert "❌" in text and text.count("✅") == 2
+    assert "напрямую" in text and "прокси" in text
+
+
+async def test_proxy_check_skips_via_proxy_when_not_configured(monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    monkeypatch.delenv("VK_PROXY", raising=False)
+    monkeypatch.setattr(_vk_proxy, "check_vk_direct", lambda: (True, "10 мс"))
+    u = _cb_update(1, "px_check")
+    await bot.proxy_callback(u, MagicMock())
+    text = u.callback_query.edit_message_text.await_args.args[0]
+    assert "не настроен" in text.lower()
+
+
+async def test_proxy_check_timeout_reported(monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+
+    async def hang(*a, **k):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(bot.asyncio, "wait_for", hang)
+    u = _cb_update(1, "px_check")
+    await bot.proxy_callback(u, MagicMock())
+    text = u.callback_query.edit_message_text.await_args.args[0]
+    assert "не отвечают" in text
+
+
+# ─── downloader.py: прокси только для VK, остальные платформы не тронуты ──────
+
+def test_ytdlp_download_no_proxy_by_default(tmp_path, monkeypatch):
+    import downloader as dl
+    monkeypatch.setattr(dl, "_ensure_h264", lambda p: p)
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            captured.setdefault("opts", []).append(opts)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def extract_info(self, url, download):
+            if not download:
+                return {"duration": 5}
+            f = tmp_path / "1.mp4"
+            f.write_bytes(b"x")
+            return {"id": "1", "ext": "mp4", "title": "T"}
+        def prepare_filename(self, info):
+            return str(tmp_path / "1.mp4")
+
+    monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", FakeYDL)
+    dl._download_ytdlp_sync("http://x", str(tmp_path), "tiktok", "TikTok Video")
+    assert all("proxy" not in o for o in captured["opts"])
+
+
+def test_download_vk_ytdlp_uses_active_proxy(tmp_path, monkeypatch, tmp_db):
+    import downloader as dl
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    monkeypatch.setattr(dl, "_ensure_h264", lambda p: p)
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            captured.setdefault("opts", []).append(opts)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def extract_info(self, url, download):
+            if not download:
+                return {"duration": 5}
+            f = tmp_path / "1.mp4"
+            f.write_bytes(b"x")
+            return {"id": "1", "ext": "mp4", "title": "T"}
+        def prepare_filename(self, info):
+            return str(tmp_path / "1.mp4")
+
+    monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", FakeYDL)
+    dl._download_vk_ytdlp_sync("https://vk.com/video-1_2")
+    assert all(o.get("proxy") == "socks5h://u:p@1.2.3.4:1080" for o in captured["opts"])
+
+
+def test_download_vk_ytdlp_no_proxy_when_disabled(tmp_path, monkeypatch, tmp_db):
+    import downloader as dl
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    _vk_proxy.set_enabled(False)
+    monkeypatch.setattr(dl, "_ensure_h264", lambda p: p)
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            captured.setdefault("opts", []).append(opts)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def extract_info(self, url, download):
+            if not download:
+                return {"duration": 5}
+            f = tmp_path / "1.mp4"
+            f.write_bytes(b"x")
+            return {"id": "1", "ext": "mp4", "title": "T"}
+        def prepare_filename(self, info):
+            return str(tmp_path / "1.mp4")
+
+    monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", FakeYDL)
+    dl._download_vk_ytdlp_sync("https://vk.com/video-1_2")
+    assert all("proxy" not in o for o in captured["opts"])
+
+
+def test_vk_direct_requests_use_proxies_kwarg(monkeypatch, tmp_db):
+    import downloader as dl
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    session = MagicMock()
+    session.get.return_value = MagicMock(text='"mp4_720":"https://cdn/x.mp4"')
+    ok = dl._try_embed(session, "-1", "2")
+    assert ok is not None
+    assert session.get.call_args.kwargs["proxies"] == {
+        "http": "socks5h://u:p@1.2.3.4:1080", "https": "socks5h://u:p@1.2.3.4:1080",
+    }
+
+
+def test_vk_api_lookup_uses_proxy(monkeypatch, tmp_db):
+    import downloader as dl
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    resp = MagicMock()
+    resp.json.return_value = {"response": {"items": [{"files": {"mp4_720": "u"}, "duration": 5}]}}
+    with patch.object(dl, "_make_session", return_value=MagicMock(get=MagicMock(return_value=resp))) as ms:
+        dl._try_vk_api("-1", "2", "tok")
+    session = ms.return_value
+    assert session.get.call_args.kwargs["proxies"] == {
+        "http": "socks5h://u:p@1.2.3.4:1080", "https": "socks5h://u:p@1.2.3.4:1080",
+    }
+
+
+def test_likee_never_uses_vk_proxy(monkeypatch, tmp_db):
+    """Likee всегда идёт напрямую, даже если VK-прокси включён."""
+    import downloader as dl
+    monkeypatch.setenv("VK_PROXY", "socks5h://u:p@1.2.3.4:1080")
+    resp = MagicMock(status_code=200, url="https://likee.video/v/x",
+                      text='<meta property="og:video" content="https://x/v.mp4">')
+    with patch.object(dl, "_make_session", return_value=MagicMock(get=MagicMock(return_value=resp))) as ms:
+        dl._get_likee_info_sync("https://likee.video/v/x")
+    session = ms.return_value
+    assert session.get.call_args.kwargs["proxies"] is None
