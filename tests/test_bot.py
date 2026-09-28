@@ -1337,7 +1337,7 @@ def test_format_error_ambiguous():
     assert "проверь группу" in text
 
 
-@pytest.mark.parametrize("code,needle", [(5, "токен"), (15, "администратор"), (14, "капч")])
+@pytest.mark.parametrize("code,needle", [(5, "токен"), (15, "администратор"), (14, "капч"), (18, "удалён или заблокирован")])
 def test_format_error_known_vk_codes(code, needle):
     text = bot._format_error(bot.VKError(code, f"VK {code}: x"), "VK wall.post", "G")
     assert needle in text
